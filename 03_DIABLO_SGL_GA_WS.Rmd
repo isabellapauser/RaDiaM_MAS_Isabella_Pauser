@@ -11,14 +11,14 @@ output:
 ---
 
 # *DIABLO Melanoma Multi-Omics Study*
-This workflow integrates RNA-seq and LFQ proteomics data using DIABLO. The aim is to identify a correlated multi-omics signature that separates `1G` and `DLN`.
+This workflow integrates RNA-seq, LFQ proteomics and SERS data using DIABLO. The aim is to identify a correlated multi-omics signature that separates the two melanoma cell lines `1G` and `DLN`.
 The transcriptomics part uses only the 2D cell samples. The proteomics part uses the MaxQuant `proteinGroups` file where technical replicates were already merged.
-In total six groups will be retained 1G_A/_B/_C and DLN_A/_B/_C.
+In total six groups will be retained across the three omics layers: 1G_A/_B/_C and DLN_A/_B/_C.
 
-This script provides three approaches for reducing the SERS feature space: sparse group lasso (`SGL`), a genetic algorithm (`GA`), and correlation-based variable window selection (`WS`). The method is selected with the `sers_selection_method` parameter in the YAML header.
+Note: This script provides three approaches for reducing the SERS feature space: sparse group lasso (`SGL`), a genetic algorithm (`GA`), and correlation-based variable window selection (`WS`). The method is selected with the `sers_selection_method` parameter in the YAML header.
 
 ## Setup
-Configure global R Markdown settings, standardize plot parameters, define the project root directory, and ensure reproducibility.
+Standardize plot parameters and define the project root directory.
 
 ```{r setup, include=FALSE}
 setwd("../DIABLO_Melanoma_Pauser")
@@ -67,6 +67,20 @@ library(GA)
 library(parallel)
 library(doParallel)
 
+if (!requireNamespace("ComplexHeatmap", quietly = TRUE)) {
+  stop(
+    "Package 'ComplexHeatmap' is required for the labelled DIABLO heatmap. ",
+    "Install it with BiocManager::install('ComplexHeatmap')."
+  )
+}
+
+if (!requireNamespace("circlize", quietly = TRUE)) {
+  stop(
+    "Package 'circlize' is required for the labelled DIABLO heatmap. ",
+    "Install it with install.packages('circlize')."
+  )
+}
+
 set.seed(123)
 
 sers_selection_method <- toupper(params$sers_selection_method)
@@ -101,7 +115,6 @@ rna_dir  <- file.path(project_root, "Transcriptome")
 prot_dir <- file.path(project_root, "Proteome")
 sers_dir <- file.path(project_root, "SERS")
 
-# Keep complete SGL, GA, and WS runs in separate output folders.
 sers_method_tag <- toupper(sers_selection_method)
 
 results_dir <- file.path(
@@ -150,19 +163,19 @@ stopifnot(
 
 ```{r helper-functions}
 clean_sample_names <- function(x) {
-  x = basename(x)
-  x = gsub("[.]bam$|[.]sorted$|[.]rmdup$|[.]counts$|[.]txt$|[.]tsv$|[.]csv$", "", x, ignore.case = TRUE)
-  x = gsub("[.]featurecount$|[.]featurecounts$|_featurecount$|_featurecounts$|_counts$", "", x, ignore.case = TRUE)
-  x = gsub("LFQ[.]intensity[.]", "", x, ignore.case = TRUE)
-  x = gsub("Intensity[.]", "", x, ignore.case = TRUE)
-  x = gsub("Reporter[.]intensity[.]", "", x, ignore.case = TRUE)
-  x = gsub("[^A-Za-z0-9]+", "_", x)
-  x = gsub("^_|_$", "", x)
+  x <- basename(x)
+  x <- gsub("[.]bam$|[.]sorted$|[.]rmdup$|[.]counts$|[.]txt$|[.]tsv$|[.]csv$", "", x, ignore.case = TRUE)
+  x <- gsub("[.]featurecount$|[.]featurecounts$|_featurecount$|_featurecounts$|_counts$", "", x, ignore.case = TRUE)
+  x <- gsub("LFQ[.]intensity[.]", "", x, ignore.case = TRUE)
+  x <- gsub("Intensity[.]", "", x, ignore.case = TRUE)
+  x <- gsub("Reporter[.]intensity[.]", "", x, ignore.case = TRUE)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("^_|_$", "", x)
   x
 }
 
 make_unique <- function(x) {
-  x = ifelse(is.na(x) | x == "", "feature", x)
+  x <- ifelse(is.na(x) | x == "", "feature", x)
   make.unique(x)
 }
 
@@ -175,39 +188,39 @@ get_biorep <- function(x) {
 }
 
 collapse_columns_by_name_sum <- function(mat) {
-  ids = colnames(mat)
-  ids_unique = unique(ids)
+  ids <- colnames(mat)
+  ids_unique <- unique(ids)
   
-  collapsed = sapply(ids_unique, function(id) {
-    cols = which(ids == id)
+  collapsed <- sapply(ids_unique, function(id) {
+    cols <- which(ids == id)
     rowSums(mat[, cols, drop = FALSE], na.rm = TRUE)
   })
   
-  collapsed = as.matrix(collapsed)
-  colnames(collapsed) = ids_unique
+  collapsed <- as.matrix(collapsed)
+  colnames(collapsed) <- ids_unique
   collapsed
 }
 
 harmonise_rna_sample_names <- function(x) {
-  x = basename(x)
-  x = gsub("[.]featurecount$|[.]featurecounts$", "", x, ignore.case = TRUE)
-  x = gsub("_STAR.*$", "", x, ignore.case = TRUE)
-  x = gsub("-", "_", x)
-  x = gsub("[^A-Za-z0-9]+", "_", x)
-  x = gsub("^_|_$", "", x)
+  x <- basename(x)
+  x <- gsub("[.]featurecount$|[.]featurecounts$", "", x, ignore.case = TRUE)
+  x <- gsub("_STAR.*$", "", x, ignore.case = TRUE)
+  x <- gsub("-", "_", x)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("^_|_$", "", x)
   
-  rep_map = c("1" = "A", "2" = "B", "3" = "C")
-  out = rep(NA_character_, length(x))
+  rep_map <- c("1" = "A", "2" = "B", "3" = "C")
+  out <- rep(NA_character_, length(x))
   
   for (i in seq_along(x)) {
-    parts = strsplit(x[i], "_")[[1]]
+    parts <- strsplit(x[i], "_")[[1]]
     
     if (length(parts) == 2 && parts[1] == "1G" && parts[2] %in% names(rep_map)) {
-      out[i] = paste0("1G_", rep_map[parts[2]])
+      out[i] <- paste0("1G_", rep_map[parts[2]])
     }
     
     if (length(parts) == 3 && parts[1] == "DLN" && parts[2] == "2D" && parts[3] %in% names(rep_map)) {
-      out[i] = paste0("DLN_", rep_map[parts[3]])
+      out[i] <- paste0("DLN_", rep_map[parts[3]])
     }
   }
   
@@ -215,41 +228,41 @@ harmonise_rna_sample_names <- function(x) {
 }
 
 harmonise_sers_sample_names <- function(x) {
-  x = basename(x)
-  group = ifelse(grepl("_1G_", x), "1G", ifelse(grepl("_DLN_", x), "DLN", NA_character_))
-  m = sub(".*_M([123])[.].*$", "\\1", x)
-  rep_map = c("1" = "A", "2" = "B", "3" = "C")
-  rep = rep_map[m]
+  x <- basename(x)
+  group <- ifelse(grepl("_1G_", x), "1G", ifelse(grepl("_DLN_", x), "DLN", NA_character_))
+  m <- sub(".*_M([123])[.].*$", "\\1", x)
+  rep_map <- c("1" = "A", "2" = "B", "3" = "C")
+  rep <- rep_map[m]
   ifelse(!is.na(group) & !is.na(rep), paste0(group, "_", rep), NA_character_)
 }
 
 harmonise_prot_sample_names <- function(x) {
-  x = clean_sample_names(x)
-  x = gsub("^LFQ_intensity_", "", x, ignore.case = TRUE)
-  x = gsub("^LFQ_intensity", "", x, ignore.case = TRUE)
-  x = gsub("^Intensity_", "", x, ignore.case = TRUE)
-  x = gsub("^Reporter_intensity_", "", x, ignore.case = TRUE)
-  x = gsub("_2D_", "_", x, ignore.case = TRUE)
-  x = gsub("DLN_2D_", "DLN_", x, ignore.case = TRUE)
-  x = gsub("[^A-Za-z0-9]+", "_", x)
-  x = gsub("^_|_$", "", x)
+  x <- clean_sample_names(x)
+  x <- gsub("^LFQ_intensity_", "", x, ignore.case = TRUE)
+  x <- gsub("^LFQ_intensity", "", x, ignore.case = TRUE)
+  x <- gsub("^Intensity_", "", x, ignore.case = TRUE)
+  x <- gsub("^Reporter_intensity_", "", x, ignore.case = TRUE)
+  x <- gsub("_2D_", "_", x, ignore.case = TRUE)
+  x <- gsub("DLN_2D_", "DLN_", x, ignore.case = TRUE)
+  x <- gsub("[^A-Za-z0-9]+", "_", x)
+  x <- gsub("^_|_$", "", x)
   
-  rep_map = c("1" = "A", "2" = "B", "3" = "C")
-  out = rep(NA_character_, length(x))
+  rep_map <- c("1" = "A", "2" = "B", "3" = "C")
+  out <- rep(NA_character_, length(x))
   
   for (i in seq_along(x)) {
-    parts = strsplit(x[i], "_")[[1]]
+    parts <- strsplit(x[i], "_")[[1]]
     
     if (length(parts) >= 2 && parts[1] == "1G") {
-      rep_token = parts[2]
-      if (rep_token %in% names(rep_map)) rep_token = rep_map[rep_token]
-      if (rep_token %in% c("A", "B", "C")) out[i] = paste0("1G_", rep_token)
+      rep_token <- parts[2]
+      if (rep_token %in% names(rep_map)) rep_token <- rep_map[rep_token]
+      if (rep_token %in% c("A", "B", "C")) out[i] <- paste0("1G_", rep_token)
     }
     
     if (length(parts) >= 2 && parts[1] == "DLN") {
-      rep_token = parts[length(parts)]
-      if (rep_token %in% names(rep_map)) rep_token = rep_map[rep_token]
-      if (rep_token %in% c("A", "B", "C")) out[i] = paste0("DLN_", rep_token)
+      rep_token <- parts[length(parts)]
+      if (rep_token %in% names(rep_map)) rep_token <- rep_map[rep_token]
+      if (rep_token %in% c("A", "B", "C")) out[i] <- paste0("DLN_", rep_token)
     }
   }
   out
@@ -259,10 +272,6 @@ harmonise_prot_sample_names <- function(x) {
 ## Define and verify the RNA-seq input files
 
 ```{r rna-load}
-# Define and verify RNA-seq input files
-
-rna_dir <- "./Transcriptome"
-
 rna_files <- file.path(
   rna_dir,
   c(
@@ -290,41 +299,41 @@ stopifnot(length(rna_files) == 6)
 ## Read, merge, and format the RNA-seq count data
 
 ```{r rna-read}
-read_featurecounts = function(f) {
-  x = read.delim(f, comment.char = "#", check.names = FALSE)
+read_featurecounts <- function(f) {
+  x <- read.delim(f, comment.char = "#", check.names = FALSE)
   if (!"Geneid" %in% colnames(x)) stop(paste("No Geneid column in", f))
   
-  annotation_cols = intersect(c("Geneid", "Chr", "Start", "End", "Strand", "Length"), colnames(x))
-  count_cols = setdiff(colnames(x), annotation_cols)
-  count_cols = count_cols[sapply(x[count_cols], is.numeric)]
+  annotation_cols <- intersect(c("Geneid", "Chr", "Start", "End", "Strand", "Length"), colnames(x))
+  count_cols <- setdiff(colnames(x), annotation_cols)
+  count_cols <- count_cols[sapply(x[count_cols], is.numeric)]
   
-  out = x[, c("Geneid", count_cols), drop = FALSE]
+  out <- x[, c("Geneid", count_cols), drop = FALSE]
   colnames(out)[-1] = harmonise_rna_sample_names(f)
   out
 }
 
-rna_list = lapply(rna_files, read_featurecounts)
+rna_list <- lapply(rna_files, read_featurecounts)
 
 if (length(rna_list) == 1) {
-  rna_counts = rna_list[[1]]
+  rna_counts <- rna_list[[1]]
 } else {
-  rna_counts = Reduce(function(a, b) full_join(a, b, by = "Geneid"), rna_list)
+  rna_counts <- Reduce(function(a, b) full_join(a, b, by = "Geneid"), rna_list)
 }
 
-rna_counts = as.data.frame(rna_counts)
-rna_gene = rna_counts$Geneid
-rna_counts = rna_counts[, -1, drop = FALSE]
+rna_counts <- as.data.frame(rna_counts)
+rna_gene <- rna_counts$Geneid
+rna_counts <- rna_counts[, -1, drop = FALSE]
 rownames(rna_counts) = make_unique(rna_gene)
 
 rna_counts[is.na(rna_counts)] = 0
-rna_counts = round(as.matrix(rna_counts))
+rna_counts <- round(as.matrix(rna_counts))
 storage.mode(rna_counts) = "integer"
 
-rna_counts = collapse_columns_by_name_sum(rna_counts)
+rna_counts <- collapse_columns_by_name_sum(rna_counts)
 storage.mode(rna_counts) = "integer"
 
-expected_samples = c("1G_A", "1G_B", "1G_C", "DLN_A", "DLN_B", "DLN_C")
-rna_counts = rna_counts[, expected_samples, drop = FALSE]
+expected_samples <- c("1G_A", "1G_B", "1G_C", "DLN_A", "DLN_B", "DLN_C")
+rna_counts <- rna_counts[, expected_samples, drop = FALSE]
 
 cat("RNA samples retained:\n")
 print(colnames(rna_counts))
@@ -340,7 +349,7 @@ if (!file.exists(prot_file)) {
   stop(paste("Proteomics file does not exist:", prot_file))
 }
 
-prot_raw = read.delim(prot_file, check.names = FALSE)
+prot_raw <- read.delim(prot_file, check.names = FALSE)
 dim(prot_raw)
 head(prot_raw[, 1:min(6, ncol(prot_raw))])
 ```
@@ -348,8 +357,6 @@ head(prot_raw[, 1:min(6, ncol(prot_raw))])
 # Format, label, and filter the proteomics data without imputation.
 
 ```{r prot-format}
-# Format and filter the proteomics data
-
 feature_cols <- grep(
   "gene|protein|uniprot|accession|id|name|description",
   colnames(prot_raw),
@@ -357,9 +364,10 @@ feature_cols <- grep(
   value = TRUE
 )
 
-numeric_cols <- colnames(prot_raw)[vapply(prot_raw, is.numeric, logical(1))]
+numeric_cols <- colnames(prot_raw)[
+  vapply(prot_raw, is.numeric, logical(1))
+]
 
-# Select short protein labels for subsequent visualizations
 preferred_feature_cols <- c(
   "Gene names", "Gene.names", "Gene name", "Gene.name",
   "Protein names", "Protein.names",
@@ -446,7 +454,6 @@ dim(prot_mat)
 prot_mat[1:5, 1:min(5, ncol(prot_mat))]
 ```
 
-# SERS data
 ## Load and format the SERS data.
 
 ```{r sers-import}
@@ -460,8 +467,6 @@ sers_raw <- read.csv(
 )
 
 stopifnot(all(c("label", "file") %in% colnames(sers_raw)))
-
-# Identify spectral variables and biological samples
 
 sers_feature_cols <- setdiff(
   colnames(sers_raw),
@@ -489,8 +494,6 @@ sers_sample_id <- sers_sample_id[keep_sers]
 cat("Spectra per biological sample:\n")
 print(table(sers_sample_id))
 
-# Class labels
-
 sers_classes <- factor(
   ifelse(grepl("^1G_", sers_sample_id), "1G", "DLN"),
   levels = c("1G", "DLN")
@@ -506,8 +509,6 @@ stopifnot(
 
 cat("\nSERS class distribution:\n")
 print(table(sers_classes))
-
-# Extract and order Raman shifts
 
 sers_wavenumbers_raw <- suppressWarnings(
   as.numeric(
@@ -546,9 +547,7 @@ colnames(sers_x_raw) <- make.unique(
   )
 )
 
-# Define contiguous fixed-width Raman windows for SGL and GA
-
-# Window width in cm^-1
+# Ten-wavenumber groups preserve local spectral structure for SGL and GA.
 sgl_window_width <- 10
 
 sers_grouping <- floor(
@@ -692,17 +691,16 @@ minimum_cv_error <- min(
   na.rm = TRUE
 )
 
-# There may be several models with the same minimum error.
+# Prefer the sparsest model when several candidates have the same CV error.
 best_candidates <- which(
   is.finite(sgl_error) &
     abs(sgl_error - minimum_cv_error) < sqrt(.Machine$double.eps)
 )
 
-cat("\nModels tied for minimum CV error:\n")
-print(best_candidates)
+cat("Tied CV models:", paste(best_candidates, collapse = ", "), "\n")
 
 cat(
-  "Minimum cross-validation error:",
+  "Minimum CV error:",
   minimum_cv_error,
   "\n"
 )
@@ -728,8 +726,6 @@ sgl_fit <- msgl::fit(
   standardize = TRUE
 )
 
-# Official msgl interface:
-# one character vector of non-zero features per model
 sgl_feature_path <- features(sgl_fit)
 
 if (length(sgl_feature_path) != length(sgl_error)) {
@@ -743,8 +739,7 @@ if (length(sgl_feature_path) != length(sgl_error)) {
   )
 }
 
-# Count actual SERS features in every tied model.
-# The intercept is not counted.
+# Exclude the intercept when comparing tied models.
 candidate_feature_counts <- vapply(
   best_candidates,
   function(model_index) {
@@ -766,27 +761,24 @@ candidate_summary <- data.frame(
   stringsAsFactors = FALSE
 )
 
-cat("\nCandidate models with minimum CV error:\n")
+cat("Tied-model summary:\n")
 print(candidate_summary)
 
-# Select the sparsest model among equally performing models.
 sgl_best_index <- best_candidates[
   which.min(candidate_feature_counts)
 ]
 
 cat(
-  "\nSelected SGL model index:",
+  "Selected SGL model:",
   sgl_best_index,
   "\n"
 )
 
 cat(
-  "Cross-validation error:",
+  "CV error:",
   sgl_error[sgl_best_index],
   "\n"
 )
-
-# Extract selected SERS variables
 
 sers_selected_features <- setdiff(
   sgl_feature_path[[sgl_best_index]],
@@ -810,14 +802,12 @@ if (length(sers_selected_features) == 0) {
 }
 
 cat(
-  "Number of selected SERS wavenumbers:",
+  "Selected SERS wavenumbers:",
   length(sers_selected_features),
   "\n"
 )
 
 print(sers_selected_features)
-
-# Create selected-variable table
 
 selected_idx <- match(
   sers_selected_features,
@@ -839,7 +829,6 @@ sers_sgl_selection <- sers_sgl_selection[
   drop = FALSE
 ]
 
-# Add boundaries of each fixed spectral window
 sers_sgl_selection$window_start <- min(sers_wavenumbers_raw) +
   (sers_sgl_selection$group - 1) * sgl_window_width
 
@@ -847,8 +836,6 @@ sers_sgl_selection$window_end <- (
   sers_sgl_selection$window_start +
     sgl_window_width
 )
-
-# Summarize selected spectral groups
 
 sers_selected_regions <- aggregate(
   wavenumber ~ group + window_start + window_end,
@@ -878,7 +865,7 @@ sers_selected_regions <- sers_selected_regions[
 ]
 
 cat(
-  "Number of selected spectral regions:",
+  "Selected spectral regions:",
   nrow(sers_selected_regions),
   "\n"
 )
@@ -2064,18 +2051,18 @@ perf_initial$choice.ncomp$WeightedVote
 ## Tune the number of selected features
 
 ```{r tune-features}
-test_keepX <- list(
+test_keep_x <- list(
   transcriptome = c(5, 10, 15),
   proteome = c(5, 10, 15),
   sers = c(2, 5, 9)
 )
 
 # Ensure that candidates do not exceed the available features
-test_keepX <- Map(
+test_keep_x <- Map(
   function(candidates, block) {
     candidates[candidates <= ncol(block)]
   },
-  candidates = test_keepX,
+  candidates = test_keep_x,
   block = data
 )
 
@@ -2085,7 +2072,7 @@ tune_diablo <- tune.block.splsda(
   X = data,
   Y = Y,
   ncomp = ncomp_final,
-  test.keepX = test_keepX,
+  test.keepX = test_keep_x,
   design = design,
   validation = "Mfold",
   folds = n_folds,
@@ -2100,24 +2087,22 @@ tune_diablo$choice.keepX
 ## Extract the tuned feature numbers
 
 ```{r extract-keepx}
-keepX_final <- tune_diablo$choice.keepX
+keep_x_final <- tune_diablo$choice.keepX
 
-keepX_final
+keep_x_final
 ```
 
 # Final model
 ## Fit the final sparse DIABLO model
 
 ```{r diablo-final}
-keepX_final <- tune_diablo$choice.keepX
-
 set.seed(123)
 
 final_diablo_model <- block.splsda(
   X = data,
   Y = Y,
   ncomp = ncomp_final,
-  keepX = keepX_final,
+  keepX = keep_x_final,
   design = design,
   near.zero.var = TRUE
 )
@@ -2334,8 +2319,6 @@ visualization_model <- block.splsda(
 ```
 
 ```{r plot-diablo}
-# Display agreement between omics-specific components
-
 plotDiablo(
   visualization_model,
   ncomp = 2
@@ -2343,8 +2326,6 @@ plotDiablo(
 ```
 
 ```{r plot-individuals}
-# Display samples on the first two components
-
 plotIndiv(
   visualization_model,
   comp = c(1, 2),
@@ -2355,8 +2336,6 @@ plotIndiv(
 ```
 
 ```{r plot-arrows}
-# Display sample agreement across the omics blocks
-
 plotArrow(
   visualization_model,
   comp = c(1, 2),
@@ -2367,8 +2346,6 @@ plotArrow(
 ```
 
 ```{r plot-variables}
-# Display variables from all three omics blocks
-
 plotVar(
   visualization_model,
   comp = c(1, 2),
@@ -2388,8 +2365,6 @@ plotVar(
 # Correlation plots
 
 ```{r circos-plot, fig.width=20, fig.height=16, out.width="100%"}
-# Display correlations among features selected by the final model
-
 circosPlot(
   final_diablo_model,
   cutoff = 0.7,
@@ -2413,8 +2388,6 @@ circosPlot(
 ```
 
 ```{r network-plot, fig.width=14, fig.height=10, out.width="90%"}
-# Display correlations among the selected multi-omics features
-
 set.seed(123)
 
 mixOmics::network(
@@ -2432,21 +2405,140 @@ mixOmics::network(
 
 # Clustered image map
 
-```{r cim-diablo, fig.width=24, fig.height=18, out.width="100%"}
-# Display the selected multi-omics signature across samples
+```{r cim-diablo, fig.width=24, fig.height=14, out.width="100%"}
+make_labelled_diablo_heatmap <- function(model) {
+  block_label_map <- c(
+    transcriptome = "Gene",
+    proteome = "Protein",
+    sers = "SERS"
+  )
 
-cimDiablo(
-  final_diablo_model,
-  cluster = "column",
-  size.legend = 0.65
+  selected_matrices <- lapply(names(model$X), function(block_name) {
+    block_loadings <- as.matrix(model$loadings[[block_name]])
+    selected <- rowSums(abs(block_loadings), na.rm = TRUE) > 0
+    model$X[[block_name]][, selected, drop = FALSE]
+  })
+
+  names(selected_matrices) <- names(model$X)
+  heatmap_matrix <- do.call(cbind, selected_matrices)
+
+  variable_blocks <- unlist(
+    Map(
+      function(block_name, block_matrix) {
+        rep(block_label_map[[block_name]], ncol(block_matrix))
+      },
+      names(selected_matrices),
+      selected_matrices
+    ),
+    use.names = FALSE
+  )
+
+  sample_groups <- ifelse(
+    as.character(model$Y) == "1G",
+    "MCM-1G",
+    "MCM-DLN"
+  )
+
+  sample_groups <- factor(
+    sample_groups,
+    levels = c("MCM-DLN", "MCM-1G")
+  )
+
+  variable_blocks <- factor(
+    variable_blocks,
+    levels = c("Gene", "Protein", "SERS")
+  )
+
+  sample_order <- order(sample_groups)
+  heatmap_matrix <- heatmap_matrix[sample_order, , drop = FALSE]
+  sample_groups <- sample_groups[sample_order]
+
+  # Match cimDiablo's display range while retaining the selected values
+  heatmap_matrix[heatmap_matrix > 2] <- 2
+  heatmap_matrix[heatmap_matrix < -2] <- -2
+
+  # Write the condition names directly into the coloured left blocks
+  group_annotation <- ComplexHeatmap::rowAnnotation(
+    Group = ComplexHeatmap::anno_block(
+      gp = grid::gpar(fill = c("#F28E2B", "#2C7FB8"), col = "white"),
+      labels = c("MCM-DLN", "MCM-1G"),
+      labels_gp = grid::gpar(
+        col = "white",
+        fontsize = 11,
+        fontface = "bold"
+      ),
+      width = grid::unit(18, "mm")
+    ),
+    show_annotation_name = FALSE
+  )
+
+  # Write Gene, Protein and SERS directly into the coloured top blocks
+  block_annotation <- ComplexHeatmap::HeatmapAnnotation(
+    Block = ComplexHeatmap::anno_block(
+      gp = grid::gpar(
+        fill = c("#C44E52", "#55A868", "#4C72B0"),
+        col = "white"
+      ),
+      labels = c("Gene", "Protein", "SERS"),
+      labels_gp = grid::gpar(
+        col = "white",
+        fontsize = 11,
+        fontface = "bold"
+      ),
+      height = grid::unit(9, "mm")
+    ),
+    show_annotation_name = FALSE
+  )
+
+  color_limit <- max(abs(heatmap_matrix), na.rm = TRUE)
+  heatmap_colors <- circlize::colorRamp2(
+    seq(-color_limit, color_limit, length.out = 64),
+    mixOmics::color.jet(64)
+  )
+
+  ComplexHeatmap::Heatmap(
+    heatmap_matrix,
+    name = "Scaled value",
+    col = heatmap_colors,
+    row_split = sample_groups,
+    column_split = variable_blocks,
+    cluster_rows = FALSE,
+    cluster_row_slices = FALSE,
+    cluster_columns = TRUE,
+    cluster_column_slices = FALSE,
+    left_annotation = group_annotation,
+    top_annotation = block_annotation,
+    show_row_names = FALSE,
+    show_column_names = TRUE,
+    row_title = NULL,
+    column_names_gp = grid::gpar(fontsize = 11, fontface = "bold"),
+    column_names_rot = 45,
+    column_names_max_height = grid::unit(85, "mm"),
+    column_title = NULL,
+    row_gap = grid::unit(8, "mm"),
+    column_gap = grid::unit(3, "mm"),
+    rect_gp = grid::gpar(col = "white", lwd = 0.6),
+    border = TRUE,
+    heatmap_legend_param = list(
+      title = "Scaled value",
+      legend_height = grid::unit(45, "mm")
+    )
+  )
+}
+
+labelled_diablo_heatmap <- make_labelled_diablo_heatmap(
+  final_diablo_model
+)
+
+ComplexHeatmap::draw(
+  labelled_diablo_heatmap,
+  heatmap_legend_side = "right"
 )
 ```
 
 # Save figures
 
 ```{r save-figures}
-# Export the principal DIABLO figures as PNG files
-
 save_png <- function(
   filename,
   plot_code,
@@ -2583,14 +2675,13 @@ save_png(
 
 save_png(
   "DIABLO_clustered_image_map",
-  cimDiablo(
-    final_diablo_model,
-    cluster = "column",
-    size.legend = 0.65
+  ComplexHeatmap::draw(
+    labelled_diablo_heatmap,
+    heatmap_legend_side = "right"
   ),
-  width = 5000,
-  height = 4000,
-  resolution = 250
+  width = 7800,
+  height = 4800,
+  resolution = 300
 )
 
 cat(
@@ -2606,43 +2697,25 @@ network_file <- file.path(
   paste0(sers_method_tag, "_DIABLO_network.png")
 )
 
-png(
-  filename = network_file,
-  width = 30,
-  height = 24,
-  units = "in",
-  res = 150
+network_candidates <- list.files(
+  path = knitr::opts_chunk$get("fig.path"),
+  pattern = "^network-plot-[0-9]+[.]png$",
+  full.names = TRUE
 )
 
-layout(matrix(1))
+if (length(network_candidates) == 0L) {
+  stop("Rendered network figure not found.")
+}
 
-par(
-  fig = c(0, 1, 0, 1),
-  mar = c(0.5, 0.5, 0.5, 0.5),
-  oma = c(0, 0, 0, 0),
-  xpd = NA,
-  new = FALSE
-)
+network_source <- network_candidates[
+  which.max(file.info(network_candidates)$mtime)
+]
 
-set.seed(123)
-
-mixOmics::network(
-  final_diablo_model,
-  blocks = c(1, 2, 3),
-  color.node = c(
-    "brown1",
-    "lightgreen",
-    "steelblue"
-  ),
-  cutoff = 0.4,
-  size.node = 0.55
-)
-
-dev.off()
+file.copy(network_source, network_file, overwrite = TRUE)
 
 cat("Network saved to:", network_file, "\n")
 ```
 
 ```{r session-info}
-session_info()
+sessionInfo()
 ```
