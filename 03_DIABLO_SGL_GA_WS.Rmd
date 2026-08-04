@@ -11,14 +11,14 @@ output:
 ---
 
 # *DIABLO Melanoma Multi-Omics Study*
-This workflow integrates RNA-seq, LFQ proteomics and SERS data using DIABLO. The aim is to identify a correlated multi-omics signature that separates the two melanoma cell lines `1G` and `DLN`.
+This workflow integrates RNA-seq and LFQ proteomics data using DIABLO. The aim is to identify a correlated multi-omics signature that separates `1G` and `DLN`.
 The transcriptomics part uses only the 2D cell samples. The proteomics part uses the MaxQuant `proteinGroups` file where technical replicates were already merged.
-In total six groups will be retained across the three omics layers: 1G_A/_B/_C and DLN_A/_B/_C.
+In total six groups will be retained 1G_A/_B/_C and DLN_A/_B/_C.
 
-Note: This script provides three approaches for reducing the SERS feature space: sparse group lasso (`SGL`), a genetic algorithm (`GA`), and correlation-based variable window selection (`WS`). The method is selected with the `sers_selection_method` parameter in the YAML header.
+This script provides three approaches for reducing the SERS feature space: sparse group lasso (`SGL`), a genetic algorithm (`GA`), and correlation-based variable window selection (`WS`). The method is selected with the `sers_selection_method` parameter in the YAML header.
 
 ## Setup
-Standardize plot parameters and define the project root directory.
+Configure global R Markdown settings, standardize plot parameters, define the project root directory, and ensure reproducibility.
 
 ```{r setup, include=FALSE}
 setwd("../DIABLO_Melanoma_Pauser")
@@ -342,7 +342,7 @@ dim(rna_counts)
 rna_counts[1:5, 1:min(5, ncol(rna_counts))]
 ```
 
-## Load and inspect the proteomics data.
+## Load and inspect the proteomics data
 
 ```{r prot-load}
 if (!file.exists(prot_file)) {
@@ -354,7 +354,59 @@ dim(prot_raw)
 head(prot_raw[, 1:min(6, ncol(prot_raw))])
 ```
 
-# Format, label, and filter the proteomics data without imputation.
+# Remove MaxQuant artefact identifications
+
+```{r prot-filter-artifacts}
+maxquant_flag_columns <- c(
+  "Reverse",
+  "Potential contaminant",
+  "Only identified by site"
+)
+
+available_flag_columns <- intersect(
+  maxquant_flag_columns,
+  colnames(prot_raw)
+)
+
+artefact_rows <- rep(FALSE, nrow(prot_raw))
+
+for (flag_column in available_flag_columns) {
+  artefact_rows <- artefact_rows |
+    trimws(as.character(prot_raw[[flag_column]])) == "+"
+}
+
+maxquant_id_columns <- intersect(
+  c("Protein IDs", "Majority protein IDs"),
+  colnames(prot_raw)
+)
+
+if (length(maxquant_id_columns) > 0) {
+  artefact_id_rows <- Reduce(
+    `|`,
+    lapply(
+      maxquant_id_columns,
+      function(id_column) {
+        grepl(
+          "(^|;) *(CON__|REV__)",
+          as.character(prot_raw[[id_column]]),
+          ignore.case = TRUE
+        )
+      }
+    )
+  )
+
+  artefact_rows <- artefact_rows | artefact_id_rows
+}
+
+cat("MaxQuant rows before artefact filtering:", nrow(prot_raw), "\n")
+cat("MaxQuant artefact rows removed:", sum(artefact_rows), "\n")
+
+prot_raw <- prot_raw[!artefact_rows, , drop = FALSE]
+
+cat("MaxQuant rows retained:", nrow(prot_raw), "\n")
+```
+
+# Format, label, and filter the proteomics data without imputation
 
 ```{r prot-format}
 feature_cols <- grep(
@@ -418,6 +470,10 @@ protein_labels[missing_labels] <- as.character(prot_raw[[1]])[missing_labels]
 protein_labels <- gsub(";.*$", "", protein_labels)
 protein_labels <- gsub("\\s+", "_", protein_labels)
 protein_labels <- substr(protein_labels, 1, 40)
+
+if (any(grepl("^(CON__|REV__)", protein_labels, ignore.case = TRUE))) {
+  stop("Contaminant or reverse-sequence identifiers remain in the proteomics data.")
+}
 
 rownames(prot_mat) <- make_unique(protein_labels)
 colnames(prot_mat) <- sample_names
@@ -1961,11 +2017,11 @@ pairwise_component_correlations
 ```
 
 # DIABLO model
-## Define the fully connected DIABLO design matrix
+## Define the weakly connected DIABLO design matrix
 
 ```{r diablo-design}
 design <- matrix(
-  1,
+  0.1,
   nrow = length(data),
   ncol = length(data),
   dimnames = list(
@@ -2321,7 +2377,7 @@ visualization_model <- block.splsda(
 ```{r plot-diablo}
 plotDiablo(
   visualization_model,
-  ncomp = 2
+  ncomp = 1
 )
 ```
 
