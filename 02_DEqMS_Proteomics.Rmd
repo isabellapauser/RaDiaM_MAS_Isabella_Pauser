@@ -1,0 +1,2288 @@
+---
+title: "DreamAI imputation validation and DEqMS analysis"
+author: "Isabella Pauser"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    self_contained: true
+    toc: true
+    toc_float: true
+params:
+  validation_runs: 10
+---
+
+# Analysis overview
+
+This report performs the DreamAI/DEqMS proteomics workflow and evaluates the
+imputation step by repeatedly masking observed values. Because the true values
+at naturally missing positions are unknown, validation is performed on complete
+proteins. Two masking schemes are considered: uniformly random missingness
+(MCAR) and low-abundance-weighted missingness (MNAR-style).
+
+Imputation performance is assessed using the correlation between observed and
+imputed intensities (ACC_OI), normalized root-mean-square error (NRMSE), and the
+Procrustes discrepancy between PCA score spaces (PSS). Higher ACC_OI and lower
+NRMSE and PSS values indicate better agreement. SOR summarizes the ranks of the
+sample-specific NRMSE values and is interpreted only relative to the methods
+included in this analysis.
+
+## 1. Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+
+project_dir <- "~/Proteomics_Melanoma_Pauser"
+setwd(project_dir)
+
+# -----------------------------
+# Load packages
+# -----------------------------
+
+library(DEqMS)
+library(limma)
+library(matrixStats)
+library(ggplot2)
+library(ggrepel)
+library(DreamAI)
+library(naniar)
+library(dplyr)
+library(tibble)
+library(pheatmap)
+library(gridExtra)
+library(grid)
+
+# -----------------------------
+# Paths
+# -----------------------------
+
+input_file <- "proteinGroups.txt"
+
+output_dir <- "Proteomics_DreamAI_results"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+```
+
+## 2. Import the MaxQuant data
+
+The MaxQuant `proteinGroups.txt` table is imported. Reverse hits and potential
+contaminants are removed.
+
+```{r import-maxquant}
+
+df.prot <- read.table(
+  input_file,
+  header = TRUE,
+  sep = "\t",
+  stringsAsFactors = FALSE,
+  comment.char = "",
+  quote = "",
+  check.names = TRUE
+)
+
+# Inspect contaminant/reverse columns
+grep("Reverse|contaminant|Contaminant", names(df.prot), value = TRUE)
+
+# Remove reverse hits and contaminants
+df.prot <- df.prot[
+  (is.na(df.prot$Reverse) | df.prot$Reverse != "+") &
+    (is.na(df.prot$Potential.contaminant) | df.prot$Potential.contaminant != "+"),
+]
+
+rownames(df.prot) <- df.prot$Majority.protein.IDs
+
+dim(df.prot)
+
+```
+
+## 3. Select and filter LFQ measurements
+
+LFQ columns for MCM-1G and MCM-DLN are selected, zeros are converted to NA,
+and proteins must contain at least two quantified values in each condition.
+
+```{r filter-lfq}
+
+lfq_cols <- grep(
+  "^LFQ\\.intensity\\.(1G_A|1G_B|1G_C|DLN_A|DLN_B|DLN_C)_",
+  names(df.prot),
+  value = TRUE
+)
+
+length(lfq_cols)
+lfq_cols
+
+df.LFQ <- df.prot[, lfq_cols]
+
+# MaxQuant LFQ values of 0 are treated as missing values
+df.LFQ[df.LFQ == 0] <- NA
+rownames(df.LFQ) <- df.prot$Majority.protein.IDs
+
+# -----------------------------
+# Filter proteins
+# Require at least 2 valid LFQ values per condition
+# -----------------------------
+
+cols_1G <- grep("^LFQ\\.intensity\\.1G_", names(df.LFQ))
+cols_DLN <- grep("^LFQ\\.intensity\\.DLN_", names(df.LFQ))
+
+df.LFQ$na_count_1G <- apply(df.LFQ[, cols_1G], 1, function(x) sum(is.na(x)))
+df.LFQ$na_count_DLN <- apply(df.LFQ[, cols_DLN], 1, function(x) sum(is.na(x)))
+
+df.LFQ.filter <- df.LFQ[
+  df.LFQ$na_count_1G <= length(cols_1G) - 2 &
+    df.LFQ$na_count_DLN <= length(cols_DLN) - 2,
+  c(cols_1G, cols_DLN)
+]
+
+dim(df.LFQ.filter)
+
+```
+
+## 4. Prepare peptide counts and the log2 LFQ matrix
+
+Peptide counts are retained for DEqMS variance modelling. The filtered LFQ
+intensities are converted to a protein-by-sample log2 matrix.
+
+```{r prepare-analysis-matrices}
+
+pep_cols <- grep(
+  "^Peptides\\.(1G_A|1G_B|1G_C|DLN_A|DLN_B|DLN_C)_",
+  names(df.prot),
+  value = TRUE
+)
+
+length(pep_cols)
+pep_cols
+
+pep.count.table <- data.frame(
+  count = rowMins(as.matrix(df.prot[, pep_cols]), na.rm = TRUE),
+  row.names = df.prot$Majority.protein.IDs
+)
+
+# DEqMS requires positive peptide counts
+# DEqMS requires a positive count; preserve valid counts and repair only zeros.
+pep.count.table$count[pep.count.table$count < 1] <- 1
+
+summary(pep.count.table$count)
+
+# -----------------------------
+# Prepare log2 LFQ matrix
+# -----------------------------
+
+lfq.matrix <- as.matrix(df.LFQ.filter)
+log2.lfq <- log2(lfq.matrix)
+
+dim(log2.lfq)
+
+```
+
+## 5. Assess missing values before imputation
+
+```{r missing-value-assessment, fig.width=11, fig.height=7}
+
+missing.data <- as.data.frame(log2.lfq)
+
+colnames(missing.data) <- gsub(
+  "LFQ\\.intensity\\.",
+  "",
+  colnames(missing.data)
+)
+
+missing.data <- missing.data[
+  c(
+    grep("^1G_", colnames(missing.data), value = TRUE),
+    grep("^DLN_", colnames(missing.data), value = TRUE)
+  )
+]
+
+missing.plot <- vis_miss(missing.data) +
+  ggtitle("Missing values before DreamAI: MCM-1G vs MCM-DLN") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8)
+  )
+
+missing.plot
+
+ggsave(
+  filename = file.path(output_dir, "Missing_Data_Pattern_Before_DreamAI_Grouped.jpg"),
+  plot = missing.plot,
+  width = 12,
+  height = 7,
+  dpi = 600
+)
+
+# -----------------------------
+# Missing value summary
+# -----------------------------
+
+missing_per_sample <- colSums(is.na(log2.lfq))
+missing_percent_sample <- colMeans(is.na(log2.lfq)) * 100
+total_missing <- sum(is.na(log2.lfq))
+overall_missing_percent <- mean(is.na(log2.lfq)) * 100
+
+missing.summary <- data.frame(
+  Sample = colnames(log2.lfq),
+  Missing_values = missing_per_sample,
+  Missing_percent = round(missing_percent_sample, 2)
+)
+
+overall.missing.summary <- data.frame(
+  Total_missing_values = total_missing,
+  Overall_missing_percent = round(overall_missing_percent, 2)
+)
+
+missing.summary
+overall.missing.summary
+
+write.table(
+  missing.summary,
+  file.path(output_dir, "Missing_values_per_sample_before_DreamAI.txt"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+write.table(
+  overall.missing.summary,
+  file.path(output_dir, "Overall_missing_values_before_DreamAI.txt"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+```
+
+## 6. Impute missing values with DreamAI
+
+DreamAI combines KNN, MissForest, ADMIN, Birnn, SpectroFM and RegImpute in an
+ensemble. The resulting matrix is checked for its dimensions and remaining
+missing values.
+
+```{r dreamai-imputation}
+
+dreamAI.out <- DreamAI(
+  data = log2.lfq,
+  k = 10,
+  maxiter_MF = 10,
+  ntree = 100,
+  maxnodes = NULL,
+  maxiter_ADMIN = 30,
+  tol = 10^(-2),
+  gamma_ADMIN = NA,
+  gamma = 50,
+  CV = FALSE,
+  fillmethod = "row_mean",
+  maxiter_RegImpute = 10,
+  conv_nrmse = 1e-06,
+  iter_SpectroFM = 40,
+  method = c(
+    "KNN",
+    "MissForest",
+    "ADMIN",
+    "Birnn",
+    "SpectroFM",
+    "RegImpute"
+  ),
+  out = c("Ensemble")
+)
+
+str(dreamAI.out)
+names(dreamAI.out)
+
+protein.matrix <- dreamAI.out$Ensemble
+
+```
+
+## 7. Validate DreamAI by artificial masking
+
+### 7.1 Validation settings and helper functions
+
+```{r validation-functions}
+
+validation_runs <- as.integer(params$validation_runs)
+validation_scenarios <- c("MAR", "MNAR-style")
+validation_mask_fraction <- mean(is.na(log2.lfq))
+validation_reference <- log2.lfq[complete.cases(log2.lfq), , drop = FALSE]
+
+if (nrow(validation_reference) < 10L) {
+  stop("DreamAI validation requires at least 10 proteins with complete observations.")
+}
+if (!is.finite(validation_mask_fraction) || validation_mask_fraction <= 0) {
+  stop("The original matrix has no missing values; artificial masking fraction is undefined.")
+}
+
+run_dreamai_ensemble <- function(x) {
+  fit <- DreamAI(
+    data = x, k = 10, maxiter_MF = 10, ntree = 100, maxnodes = NULL,
+    maxiter_ADMIN = 30, tol = 10^(-2), gamma_ADMIN = NA, gamma = 50,
+    CV = FALSE, fillmethod = "row_mean", maxiter_RegImpute = 10,
+    conv_nrmse = 1e-06, iter_SpectroFM = 40,
+    method = c("KNN", "MissForest", "ADMIN", "Birnn", "SpectroFM", "RegImpute"),
+    out = "Ensemble"
+  )
+  as.matrix(fit$Ensemble)
+}
+
+make_validation_mask <- function(reference, fraction, scenario, max_attempts = 100L) {
+  n_mask <- max(2L, min(nrow(reference) * ncol(reference) - 1L,
+                        floor(fraction * length(reference))))
+  values <- as.numeric(reference)
+  weights <- if (scenario == "MAR") {
+    rep(1, length(values))
+  } else {
+    z <- as.numeric(scale(values))
+    plogis(-z) + 1e-06
+  }
+
+  for (attempt in seq_len(max_attempts)) {
+    selected <- sample.int(length(values), n_mask, replace = FALSE, prob = weights)
+    mask <- matrix(FALSE, nrow(reference), ncol(reference),
+                   dimnames = dimnames(reference))
+    mask[selected] <- TRUE
+    retained_by_row <- rowSums(!mask)
+    retained_by_col <- colSums(!mask)
+    if (all(retained_by_row >= 2L) && all(retained_by_col >= 2L)) return(mask)
+  }
+  stop("Could not construct a valid artificial mask after ", max_attempts, " attempts.")
+}
+
+fill_reference_methods <- function(masked) {
+  row_fill <- masked
+  row_means <- rowMeans(masked, na.rm = TRUE)
+  row_fill[is.na(row_fill)] <- row_means[row(row_fill)[is.na(row_fill)]]
+
+  column_fill <- masked
+  column_means <- colMeans(masked, na.rm = TRUE)
+  column_fill[is.na(column_fill)] <- column_means[col(column_fill)[is.na(column_fill)]]
+
+  minimum_fill <- masked
+  minimum_fill[is.na(minimum_fill)] <- min(masked, na.rm = TRUE)
+
+  list(`Row mean` = row_fill, `Column mean` = column_fill,
+       `Global minimum` = minimum_fill)
+}
+
+calculate_pss <- function(reference, reconstructed, n_components = 5L) {
+  x <- prcomp(t(reference), center = TRUE, scale. = FALSE)$x
+  y <- prcomp(t(reconstructed), center = TRUE, scale. = FALSE)$x
+  k <- min(n_components, ncol(x), ncol(y), nrow(x) - 1L)
+  x <- scale(x[, seq_len(k), drop = FALSE], center = TRUE, scale = FALSE)
+  y <- scale(y[, seq_len(k), drop = FALSE], center = TRUE, scale = FALSE)
+  x <- x / sqrt(sum(x^2))
+  y <- y / sqrt(sum(y^2))
+  rotation_svd <- svd(t(y) %*% x)
+  rotation <- rotation_svd$u %*% t(rotation_svd$v)
+  sum((x - y %*% rotation)^2)
+}
+
+calculate_metrics <- function(truth, prediction) {
+  data.frame(
+    ACC_OI = cor(truth, prediction, use = "complete.obs"),
+    NRMSE = sqrt(mean((truth - prediction)^2) / var(truth))
+  )
+}
+
+```
+
+### 7.2 Run repeated validation
+
+```{r run-validation}
+metric_results <- list()
+prediction_results <- list()
+sample_nrmse_results <- list()
+validation_status <- list()
+result_index <- 0L
+
+set.seed(20260801)
+for (scenario in validation_scenarios) {
+  for (run_id in seq_len(validation_runs)) {
+    message("DreamAI validation: ", scenario, ", repetition ", run_id,
+            " of ", validation_runs)
+    result_index <- result_index + 1L
+
+    run_result <- tryCatch({
+      artificial_mask <- make_validation_mask(
+        validation_reference, validation_mask_fraction, scenario
+      )
+      masked_matrix <- validation_reference
+      masked_matrix[artificial_mask] <- NA_real_
+
+      method_matrices <- c(
+        list(DreamAI = run_dreamai_ensemble(masked_matrix)),
+        fill_reference_methods(masked_matrix)
+      )
+
+      run_metrics <- list()
+      run_predictions <- list()
+      run_sample_nrmse <- list()
+
+      for (method_name in names(method_matrices)) {
+        completed <- method_matrices[[method_name]]
+        reconstructed <- validation_reference
+        reconstructed[artificial_mask] <- completed[artificial_mask]
+        truth <- validation_reference[artificial_mask]
+        prediction <- completed[artificial_mask]
+
+        global_metrics <- calculate_metrics(truth, prediction)
+        global_metrics$PSS <- calculate_pss(validation_reference, reconstructed)
+        global_metrics$scenario <- scenario
+        global_metrics$run <- run_id
+        global_metrics$method <- method_name
+        run_metrics[[method_name]] <- global_metrics
+
+        mask_locations <- which(artificial_mask, arr.ind = TRUE)
+        run_predictions[[method_name]] <- data.frame(
+          scenario = scenario, run = run_id, method = method_name,
+          protein = rownames(validation_reference)[mask_locations[, 1]],
+          sample = colnames(validation_reference)[mask_locations[, 2]],
+          truth = truth, prediction = prediction,
+          error = prediction - truth
+        )
+
+        per_sample <- lapply(seq_len(ncol(validation_reference)), function(j) {
+          selected <- artificial_mask[, j]
+          sample_truth <- validation_reference[selected, j]
+          sample_prediction <- completed[selected, j]
+          value <- if (length(sample_truth) >= 2L && var(sample_truth) > 0) {
+            sqrt(mean((sample_truth - sample_prediction)^2) / var(sample_truth))
+          } else NA_real_
+          data.frame(scenario = scenario, run = run_id, method = method_name,
+                     sample = colnames(validation_reference)[j], NRMSE = value)
+        })
+        run_sample_nrmse[[method_name]] <- do.call(rbind, per_sample)
+      }
+
+      list(
+        metrics = do.call(rbind, run_metrics),
+        predictions = do.call(rbind, run_predictions),
+        sample_nrmse = do.call(rbind, run_sample_nrmse)
+      )
+    }, error = function(e) e)
+
+    if (inherits(run_result, "error")) {
+      validation_status[[result_index]] <- data.frame(
+        scenario = scenario, run = run_id, status = "failed",
+        detail = conditionMessage(run_result)
+      )
+    } else {
+      metric_results[[result_index]] <- run_result$metrics
+      prediction_results[[result_index]] <- run_result$predictions
+      sample_nrmse_results[[result_index]] <- run_result$sample_nrmse
+      validation_status[[result_index]] <- data.frame(
+        scenario = scenario, run = run_id, status = "completed", detail = NA_character_
+      )
+    }
+  }
+}
+
+```
+
+### 7.3 Combine validation results and calculate SOR
+
+```{r validation-results}
+validation_status_table <- do.call(rbind, validation_status)
+if (length(metric_results) == 0L) {
+  stop("All validation repetitions failed. Inspect validation_status_table.")
+}
+
+validation_metrics <- do.call(rbind, metric_results)
+validation_predictions <- do.call(rbind, prediction_results)
+validation_sample_nrmse <- do.call(rbind, sample_nrmse_results)
+
+validation_sor <- validation_sample_nrmse %>%
+  group_by(scenario, run, sample) %>%
+  mutate(rank = rank(NRMSE, ties.method = "average", na.last = "keep")) %>%
+  ungroup() %>%
+  group_by(scenario, run, method) %>%
+  summarise(SOR = sum(rank, na.rm = TRUE), .groups = "drop")
+
+validation_metric_long <- validation_metrics %>%
+  dplyr::select(
+    scenario,
+    run,
+    method,
+    ACC_OI,
+    NRMSE,
+    PSS
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(ACC_OI, NRMSE, PSS),
+    names_to = "metric",
+    values_to = "value"
+  )
+```
+
+### 7.4 Create validation diagnostic plots
+
+```{r validation-plots, fig.width=12, fig.height=8}
+
+metric_plot <- ggplot(validation_metric_long,
+                      aes(x = method, y = value, fill = method)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.12, alpha = 0.6, size = 1.2) +
+  facet_grid(metric ~ scenario, scales = "free_y") +
+  labs(title = "Artificial-masking imputation validation",
+       subtitle = "ACC_OI: higher is better; NRMSE and PSS: lower are better",
+       x = NULL, y = NULL) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "none")
+
+sor_plot <- ggplot(validation_sor, aes(x = method, y = SOR, fill = method)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.12, alpha = 0.6, size = 1.2) +
+  facet_wrap(~scenario, scales = "free_y") +
+  labs(title = "Sum of per-sample NRMSE ranks (SOR)",
+       subtitle = "Lower is better within this reference-method set",
+       x = NULL, y = "SOR") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1), legend.position = "none")
+
+dreamai_predictions <- validation_predictions %>% filter(method == "DreamAI")
+scatter_plot <- ggplot(dreamai_predictions,
+                       aes(x = truth, y = prediction, colour = scenario)) +
+  geom_point(alpha = 0.18, size = 0.7) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  facet_wrap(~scenario) +
+  coord_equal() +
+  labs(title = "DreamAI: held-out versus imputed intensities",
+       x = "Observed log2 LFQ intensity", y = "Imputed log2 LFQ intensity") +
+  theme_bw() + theme(legend.position = "none")
+
+error_plot <- ggplot(dreamai_predictions,
+                     aes(x = truth, y = abs(error), colour = scenario)) +
+  geom_point(alpha = 0.12, size = 0.6) +
+  geom_smooth(method = "loess", se = TRUE) +
+  facet_wrap(~scenario) +
+  labs(title = "DreamAI absolute error across abundance",
+       x = "Observed log2 LFQ intensity", y = "Absolute imputation error") +
+  theme_bw() + theme(legend.position = "none")
+
+print(metric_plot)
+print(sor_plot)
+print(scatter_plot)
+print(error_plot)
+```
+
+### 7.5 Save validation results
+
+```{r save-validation-results}
+
+write.table(validation_metrics,
+            file.path(output_dir, "DreamAI_validation_metrics.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(validation_sor,
+            file.path(output_dir, "DreamAI_validation_SOR.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(validation_predictions,
+            file.path(output_dir, "DreamAI_validation_predictions.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+write.table(validation_status_table,
+            file.path(output_dir, "DreamAI_validation_status.tsv"),
+            sep = "\t", row.names = FALSE, quote = FALSE)
+saveRDS(list(metrics = validation_metrics, SOR = validation_sor,
+             predictions = validation_predictions,
+             status = validation_status_table),
+        file.path(output_dir, "DreamAI_validation_results.rds"))
+
+ggsave(file.path(output_dir, "DreamAI_validation_metrics.jpg"), metric_plot,
+       width = 12, height = 9, units = "in", dpi = 600)
+ggsave(file.path(output_dir, "DreamAI_validation_SOR.jpg"), sor_plot,
+       width = 10, height = 6, units = "in", dpi = 600)
+ggsave(file.path(output_dir, "DreamAI_validation_scatter.jpg"), scatter_plot,
+       width = 10, height = 5, units = "in", dpi = 600)
+ggsave(file.path(output_dir, "DreamAI_validation_error_by_abundance.jpg"), error_plot,
+       width = 10, height = 5, units = "in", dpi = 600)
+
+dim(protein.matrix)
+sum(is.na(protein.matrix))
+
+```
+
+## 8. Save the DreamAI matrix and inspect distributions
+
+```{r dreamai-distribution-qc, fig.width=11, fig.height=7}
+# Save DreamAI matrix
+write.table(
+  protein.matrix,
+  file.path(output_dir, "DreamAI_imputed_Melanoma_Ensemble.tsv"),
+  sep = "\t",
+  quote = FALSE
+)
+
+# -----------------------------
+# Density plot before and after DreamAI
+# -----------------------------
+
+density.df <- rbind(
+  data.frame(
+    Intensity = as.numeric(log2.lfq),
+    Status = "Original observed LFQ"
+  ),
+  data.frame(
+    Intensity = as.numeric(protein.matrix),
+    Status = "DreamAI complete LFQ"
+  )
+)
+
+density.df <- density.df[is.finite(density.df$Intensity), ]
+
+density.plot <- ggplot(
+  density.df,
+  aes(x = Intensity, fill = Status)
+) +
+  geom_density(alpha = 0.45) +
+  theme_bw(base_size = 14) +
+  labs(
+    title = "Density plot of LFQ intensities: original vs DreamAI",
+    x = "log2 LFQ intensity",
+    y = "Density"
+  )
+
+density.plot
+
+ggsave(
+  filename = file.path(output_dir, "DreamAI_DensityPlot_Original_vs_Imputed.jpg"),
+  plot = density.plot,
+  width = 7,
+  height = 5,
+  dpi = 600
+)
+
+# -----------------------------
+# Boxplot before and after DreamAI
+# -----------------------------
+
+jpeg(
+  file.path(output_dir, "DreamAI_Boxplot_Before_After.jpg"),
+  width = 8000,
+  height = 4000,
+  res = 600,
+  quality = 100
+)
+
+par(mfrow = c(1, 2), mar = c(10, 4, 4, 2))
+
+boxplot(
+  log2.lfq,
+  las = 2,
+  main = "Before DreamAI",
+  ylab = "log2 LFQ intensity"
+)
+
+boxplot(
+  protein.matrix,
+  las = 2,
+  main = "After DreamAI",
+  ylab = "log2 LFQ intensity"
+)
+
+par(mfrow = c(1, 1))
+dev.off()
+
+# -----------------------------
+# Final sample distribution QC
+# -----------------------------
+
+jpeg(
+  file.path(output_dir, "Sample_distribution_QC.jpg"),
+  width = 5000,
+  height = 4500,
+  res = 600,
+  quality = 100
+)
+
+boxplot(
+  protein.matrix,
+  las = 2,
+  main = "Sample LFQ intensity distributions",
+  ylab = "log2 LFQ intensity"
+)
+
+dev.off()
+
+```
+
+## 9. PCA before and after imputation
+
+```{r pca-qc, fig.width=10, fig.height=7}
+
+pca.before.matrix <- log2.lfq[complete.cases(log2.lfq), ]
+
+pca.before <- prcomp(
+  t(pca.before.matrix),
+  scale = TRUE
+)
+
+pca.after <- prcomp(
+  t(protein.matrix),
+  scale = TRUE
+)
+
+print(pca.before)
+summary(pca.before)
+
+print(pca.after)
+summary(pca.after)
+
+# -----------------------------
+# Sample metadata for PCA
+# -----------------------------
+
+make_sample_metadata <- function(sample.names) {
+  
+  sample.short <- gsub(
+    "LFQ\\.intensity\\.",
+    "",
+    sample.names
+  )
+  
+  condition <- ifelse(
+    grepl("^1G_", sample.short),
+    "MCM_1G",
+    "MCM_DLN"
+  )
+  
+  biological.replicate <- sub(
+    ".*_([ABC])_.*",
+    "\\1",
+    sample.short
+  )
+  
+  technical.replicate <- sub(
+    ".*_([0-9]+)$",
+    "\\1",
+    sample.short
+  )
+  
+  data.frame(
+    Sample = sample.names,
+    SampleShort = sample.short,
+    Condition = factor(condition, levels = c("MCM_1G", "MCM_DLN")),
+    BiologicalReplicate = factor(biological.replicate, levels = c("A", "B", "C")),
+    TechnicalReplicate = technical.replicate,
+    stringsAsFactors = FALSE
+  )
+}
+
+# -----------------------------
+# PCA variance plots
+# -----------------------------
+
+jpeg(
+  file.path(output_dir, "PCA_variance_before_DreamAI.jpg"),
+  width = 5000,
+  height = 4000,
+  res = 600,
+  quality = 100
+)
+
+plot(
+  pca.before,
+  main = "PCA variance before DreamAI"
+)
+
+dev.off()
+
+jpeg(
+  file.path(output_dir, "PCA_variance_after_DreamAI.jpg"),
+  width = 5000,
+  height = 4000,
+  res = 600,
+  quality = 100
+)
+
+plot(
+  pca.after,
+  main = "PCA variance after DreamAI"
+)
+
+dev.off()
+
+# -----------------------------
+# PCA score plots
+# -----------------------------
+
+pca.before.meta <- make_sample_metadata(rownames(pca.before$x))
+pca.after.meta <- make_sample_metadata(rownames(pca.after$x))
+
+pca.before.var <- summary(pca.before)$importance[2, 1:2] * 100
+pca.after.var <- summary(pca.after)$importance[2, 1:2] * 100
+
+pca.before.df <- data.frame(
+  PC1 = pca.before$x[, 1],
+  PC2 = pca.before$x[, 2],
+  pca.before.meta
+)
+
+pca.after.df <- data.frame(
+  PC1 = pca.after$x[, 1],
+  PC2 = pca.after$x[, 2],
+  pca.after.meta
+)
+
+pca.before.plot <- ggplot(
+  pca.before.df,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = Condition,
+    shape = BiologicalReplicate,
+    label = SampleShort
+  )
+) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3, max.overlaps = Inf) +
+  theme_bw(base_size = 14) +
+  scale_shape_manual(
+    values = c(
+      "A" = 16,
+      "B" = 17,
+      "C" = 15
+    )
+  ) +
+  ggtitle("PCA before DreamAI") +
+  xlab(paste0("PC1 (", round(pca.before.var[1], 1), "%)")) +
+  ylab(paste0("PC2 (", round(pca.before.var[2], 1), "%)")) +
+  labs(
+    color = "Condition",
+    shape = "Biological replicate"
+  )
+
+ggsave(
+  filename = file.path(output_dir, "PCA_before_DreamAI.jpg"),
+  plot = pca.before.plot,
+  width = 8,
+  height = 6,
+  dpi = 600
+)
+
+pca.after.plot <- ggplot(
+  pca.after.df,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = Condition,
+    shape = BiologicalReplicate,
+    label = SampleShort
+  )
+) +
+  geom_point(size = 4) +
+  geom_text_repel(size = 3, max.overlaps = Inf) +
+  theme_bw(base_size = 14) +
+  scale_shape_manual(
+    values = c(
+      "A" = 16,
+      "B" = 17,
+      "C" = 15
+    )
+  ) +
+  ggtitle("PCA after DreamAI") +
+  xlab(paste0("PC1 (", round(pca.after.var[1], 1), "%)")) +
+  ylab(paste0("PC2 (", round(pca.after.var[2], 1), "%)")) +
+  labs(
+    color = "Condition",
+    shape = "Biological replicate"
+  )
+
+ggsave(
+  filename = file.path(output_dir, "PCA_after_DreamAI.jpg"),
+  plot = pca.after.plot,
+  width = 8,
+  height = 6,
+  dpi = 600
+)
+
+```
+
+## 10. Differential protein abundance with DEqMS
+
+The design contrasts MCM-1G against MCM-DLN. Limma fits the initial model and
+DEqMS adjusts the empirical Bayes variance estimates using peptide counts.
+
+```{r deqms-model}
+
+class <- ifelse(
+  grepl("^LFQ\\.intensity\\.1G_", colnames(protein.matrix)),
+  "MCM_1G",
+  "MCM_DLN"
+)
+
+class <- factor(class, levels = c("MCM_1G", "MCM_DLN"))
+
+design <- model.matrix(~0 + class)
+colnames(design) <- levels(class)
+
+design
+
+# -----------------------------
+# Limma model
+# -----------------------------
+
+fit1 <- lmFit(protein.matrix, design = design)
+
+cont <- makeContrasts(
+  MCM_1G - MCM_DLN,
+  levels = design
+)
+
+fit2 <- contrasts.fit(fit1, contrasts = cont)
+fit3 <- eBayes(fit2)
+
+# -----------------------------
+# DEqMS model
+# -----------------------------
+
+fit3$count <- pep.count.table[
+  rownames(fit3$coefficients),
+  "count"
+]
+
+summary(fit3$count)
+min(fit3$count, na.rm = TRUE)
+sum(is.na(fit3$count))
+
+stopifnot(!any(is.na(fit3$count)))
+stopifnot(min(fit3$count, na.rm = TRUE) > 0)
+
+fit4 <- spectraCounteBayes(
+  fit3,
+  fit.method = "loess",
+  coef_col = 1
+)
+
+names(fit4)
+head(fit4$sca.t)
+head(fit4$sca.postvar)
+
+# -----------------------------
+# Extract DEqMS results
+# -----------------------------
+
+DEqMS.results <- outputResult(
+  fit4,
+  coef_col = 1
+)
+
+DEqMS.results$Gene.name <- df.prot[
+  DEqMS.results$gene,
+  "Gene.names"
+]
+
+# Final thesis cutoff
+logFC_cutoff <- 1.0 # adjust to 0.58 for more sig. proteins
+fdr_cutoff <- 0.05
+
+DEqMS.results$significant <- with(
+  DEqMS.results,
+  sca.adj.pval <= fdr_cutoff & abs(logFC) > logFC_cutoff
+)
+
+head(DEqMS.results)
+colnames(DEqMS.results)
+
+write.table(
+  DEqMS.results,
+  file.path(output_dir, "DEqMS_results_MCM_1G_vs_MCM_DLN_DreamAI.txt"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+```
+
+### 10.1 DEqMS diagnostic plots
+
+```{r deqms-diagnostics, fig.width=9, fig.height=7}
+
+jpeg(
+  file.path(output_dir, "DEqMS_VarianceScatterplot.jpg"),
+  width = 5000,
+  height = 4500,
+  res = 600,
+  quality = 100
+)
+
+VarianceScatterplot(
+  fit4,
+  xlab = "log2(Peptide count + 1)",
+  ylab = "log(Variance)",
+  main = "MCM-1G vs MCM-DLN"
+)
+
+dev.off()
+
+jpeg(
+  file.path(output_dir, "DEqMS_Residualplot.jpg"),
+  width = 5000,
+  height = 4500,
+  res = 600,
+  quality = 100
+)
+
+Residualplot(
+  fit4,
+  xlab = "log2(Peptide count + 1)",
+  ylab = "Variance(fitted - observed)",
+  main = "MCM-1G vs MCM-DLN"
+)
+
+dev.off()
+
+jpeg(
+  file.path(output_dir, "DEqMS_VarianceBoxplot.jpg"),
+  width = 5000,
+  height = 4500,
+  res = 600,
+  quality = 100
+)
+
+VarianceBoxplot(
+  fit4,
+  n = max(fit4$count, na.rm = TRUE),
+  xlab = "Peptide count + 1",
+  ylab = "log(Variance)",
+  main = "MCM-1G vs MCM-DLN"
+)
+
+dev.off()
+
+```
+
+### 10.2 Volcano and MA plots
+
+Proteins are classified using an adjusted p-value of 0.05 and an absolute
+log2-fold-change threshold of 1. Positive values indicate higher abundance in
+MCM-1G; negative values indicate higher abundance in MCM-DLN.
+
+```{r differential-abundance-plots, fig.width=10, fig.height=7}
+
+DEqMS.results$log.sca.pval <- -log10(DEqMS.results$sca.adj.pval)
+
+DEqMS.results$Regulation <- "Not significant"
+
+DEqMS.results$Regulation[
+  DEqMS.results$logFC > logFC_cutoff &
+    DEqMS.results$sca.adj.pval <= fdr_cutoff
+] <- "Up in MCM-1G"
+
+DEqMS.results$Regulation[
+  DEqMS.results$logFC < -logFC_cutoff &
+    DEqMS.results$sca.adj.pval <= fdr_cutoff
+] <- "Up in MCM-DLN"
+
+DEqMS.results$Regulation <- factor(
+  DEqMS.results$Regulation,
+  levels = c("Up in MCM-DLN", "Up in MCM-1G", "Not significant")
+)
+
+top.labels <- DEqMS.results[
+  DEqMS.results$Regulation != "Not significant" &
+    !is.na(DEqMS.results$Gene.name) &
+    DEqMS.results$Gene.name != "" &
+    is.finite(DEqMS.results$log.sca.pval),
+]
+
+top.labels <- top.labels[order(top.labels$sca.adj.pval), ]
+top.labels <- head(top.labels, 20)
+
+volcano.plot <- ggplot(
+  DEqMS.results,
+  aes(x = logFC, y = log.sca.pval)
+) +
+  geom_point(aes(color = Regulation), size = 0.6) +
+  theme_bw(base_size = 16) +
+  xlab(expression("log2(MCM-1G / MCM-DLN)")) +
+  ylab(expression("-log10(adjusted P-value)")) +
+  geom_vline(xintercept = c(-logFC_cutoff, logFC_cutoff), colour = "red") +
+  geom_hline(yintercept = -log10(fdr_cutoff), colour = "red") +
+  geom_vline(xintercept = 0, colour = "black") +
+  scale_colour_manual(
+    values = c(
+      "Up in MCM-DLN" = "blue",
+      "Up in MCM-1G" = "orange",
+      "Not significant" = "grey75"
+    )
+  ) +
+  labs(
+    colour = "Protein regulation",
+    caption = paste0(
+      "Cutoffs: |log2FC| > ",
+      logFC_cutoff,
+      " and DEqMS adjusted P-value <= ",
+      fdr_cutoff
+    )
+  )
+
+if (nrow(top.labels) > 0) {
+  volcano.plot <- volcano.plot +
+    geom_text_repel(
+      data = top.labels,
+      aes(label = Gene.name),
+      max.overlaps = 20
+    )
+}
+
+ggsave(
+  filename = file.path(output_dir, "Volcano_plot_DreamAI_DEqMS.jpg"),
+  plot = volcano.plot,
+  width = 8,
+  height = 7,
+  dpi = 600
+)
+
+# -----------------------------
+# MA plot
+# -----------------------------
+
+top.ma.labels <- DEqMS.results[
+  abs(DEqMS.results$logFC) > logFC_cutoff &
+    DEqMS.results$sca.adj.pval <= fdr_cutoff &
+    !is.na(DEqMS.results$Gene.name) &
+    DEqMS.results$Gene.name != "",
+]
+
+top.ma.labels <- top.ma.labels[
+  order(top.ma.labels$sca.adj.pval),
+]
+
+top.ma.labels <- head(top.ma.labels, 20)
+
+ma.plot <- ggplot(
+  DEqMS.results,
+  aes(
+    x = AveExpr,
+    y = logFC,
+    color = Regulation
+  )
+) +
+  geom_point(size = 0.6) +
+  geom_hline(
+    yintercept = c(-logFC_cutoff, 0, logFC_cutoff),
+    color = c("red", "black", "red")
+  ) +
+  geom_text_repel(
+    data = top.ma.labels,
+    aes(label = Gene.name),
+    size = 3,
+    max.overlaps = Inf,
+    box.padding = 0.3,
+    point.padding = 0.2,
+    show.legend = FALSE
+  ) +
+  theme_bw(base_size = 14) +
+  xlab("Average log2 LFQ intensity") +
+  ylab(expression("log2(MCM-1G / MCM-DLN)")) +
+  ggtitle("MA plot: MCM-1G vs MCM-DLN") +
+  scale_colour_manual(
+    values = c(
+      "Up in MCM-DLN" = "blue",
+      "Up in MCM-1G" = "orange",
+      "Not significant" = "grey75"
+    )
+  )
+
+ggsave(
+  filename = file.path(output_dir, "MA_plot_DreamAI_DEqMS.jpg"),
+  plot = ma.plot,
+  width = 7,
+  height = 6,
+  dpi = 600
+)
+
+
+```
+
+### 10.3 Heatmaps and individual protein plots
+
+Proteins passing the predefined fold-change and adjusted-p-value thresholds are
+displayed across samples. The matrix is standardized by protein before plotting.
+
+```{r protein-heatmaps, fig.width=11, fig.height=8}
+
+sig.proteins <- DEqMS.results[
+  DEqMS.results$sca.adj.pval <= fdr_cutoff &
+    abs(DEqMS.results$logFC) > logFC_cutoff,
+]
+
+nrow(sig.proteins)
+
+sig.ids <- sig.proteins$gene
+sig.ids <- sig.ids[sig.ids %in% rownames(protein.matrix)]
+
+heatmap.matrix <- protein.matrix[sig.ids, , drop = FALSE]
+
+dim(heatmap.matrix)
+
+if (nrow(heatmap.matrix) < 2) {
+  message("Only ", nrow(heatmap.matrix), 
+          " significant protein found. A clustered heatmap is not meaningful.")
+  
+  write.table(
+    sig.proteins,
+    file.path(output_dir, "Significant_proteins_for_heatmap.txt"),
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+} else {
+  
+  gene.labels <- DEqMS.results$Gene.name[
+    match(rownames(heatmap.matrix), DEqMS.results$gene)
+  ]
+  
+  gene.labels[is.na(gene.labels) | gene.labels == ""] <- rownames(heatmap.matrix)[
+    is.na(gene.labels) | gene.labels == ""
+  ]
+  
+  rownames(heatmap.matrix) <- make.unique(gene.labels)
+  
+  colnames(heatmap.matrix) <- gsub(
+    "LFQ\\.intensity\\.",
+    "",
+    colnames(heatmap.matrix)
+  )
+  
+  # Condition is displayed as a group heading rather than as a colour bar.
+  annotation.col <- data.frame(
+    Replicate = sub(".*_([ABC])_.*", "\\1", colnames(heatmap.matrix)),
+    Measurement = sub(".*_([0-9]+)$", "\\1", colnames(heatmap.matrix))
+  )
+  
+  rownames(annotation.col) <- colnames(heatmap.matrix)
+  
+  heatmap.matrix.z <- t(scale(t(heatmap.matrix)))
+  heatmap.matrix.z <- heatmap.matrix.z[complete.cases(heatmap.matrix.z), , drop = FALSE]
+  
+  jpeg(
+    file.path(output_dir, "Heatmap_significant_proteins_DreamAI_DEqMS.jpg"),
+    width = 6000,
+    height = 7000,
+    res = 600,
+    quality = 100
+  )
+  
+  
+  
+  # Desired sample order
+  desired.order <- c(
+    "1G_A_01","1G_A_02","1G_A_03",
+    "1G_B_01","1G_B_02","1G_B_03",
+    "1G_C_01","1G_C_02","1G_C_03",
+    "DLN_A_01","DLN_A_02","DLN_A_03",
+    "DLN_B_01","DLN_B_02","DLN_B_03",
+    "DLN_C_01","DLN_C_02","DLN_C_03"
+  )
+  
+  # Reorder the significant-protein heatmap matrix
+  available.order <- desired.order[desired.order %in% colnames(heatmap.matrix.z)]
+  heatmap.matrix.z <- heatmap.matrix.z[, available.order, drop = FALSE]
+  
+  # Reorder annotations
+  annotation.col <- annotation.col[available.order, , drop = FALSE]
+  
+  # Add a gap after each biological replicate. The central gap separates
+  # MCM-1G from MCM-DLN.
+  replicate.gaps <- c(3, 6, 9, 12, 15)
+  replicate.gaps <- replicate.gaps[replicate.gaps < ncol(heatmap.matrix.z)]
+
+  heatmap.plot <- pheatmap(
+    heatmap.matrix.z,
+    annotation_col = annotation.col,
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    gaps_col = replicate.gaps,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    fontsize_row = 7,
+    fontsize_col = 8,
+    main = NA,
+    border_color = NA,
+    silent = TRUE
+  )
+
+  # Place the condition names above their respective sample groups without
+  # encoding condition as an annotation colour.
+  matrix.layout <- heatmap.plot$gtable$layout[
+    heatmap.plot$gtable$layout$name == "matrix",
+  ]
+
+  heatmap.plot$gtable <- gtable::gtable_add_rows(
+    heatmap.plot$gtable,
+    heights = grid::unit(0.45, "cm"),
+    pos = matrix.layout$t - 1
+  )
+
+  heatmap.plot$gtable <- gtable::gtable_add_grob(
+    heatmap.plot$gtable,
+    grobs = grid::textGrob(
+      label = c("MCM-1G", "MCM-DLN"),
+      x = grid::unit(c(0.25, 0.75), "npc"),
+      y = grid::unit(0.5, "npc"),
+      gp = grid::gpar(fontface = "bold", fontsize = 10)
+    ),
+    t = matrix.layout$t,
+    l = matrix.layout$l,
+    r = matrix.layout$r,
+    clip = "off",
+    name = "condition_headings"
+  )
+
+  grid::grid.newpage()
+  grid::grid.draw(heatmap.plot$gtable)
+  
+  dev.off()
+}
+
+
+if (exists("heatmap.matrix.z") && nrow(heatmap.matrix.z) > 1L) {
+  write.table(
+    heatmap.matrix.z,
+    file.path(output_dir, "Heatmap_matrix_significant_proteins_zscore.txt"),
+    sep = "\t", quote = FALSE
+  )
+}
+
+# -----------------------------
+# Individual protein abundance plot
+# -----------------------------
+
+gene_of_interest <- "STAT3"
+
+hits <- rownames(df.prot)[
+  grepl(gene_of_interest, df.prot$Gene.names)
+]
+
+if (length(hits) > 0) {
+  
+  protein_id <- hits[1]
+  
+  plot.df <- data.frame(
+    Intensity = as.numeric(protein.matrix[protein_id, ]),
+    Sample = colnames(protein.matrix),
+    Condition = class
+  )
+  
+  protein.plot <- ggplot(
+    plot.df,
+    aes(x = Condition, y = Intensity, color = Condition)
+  ) +
+    geom_boxplot(outlier.shape = NA, alpha = 0.2) +
+    geom_jitter(width = 0.1, size = 3) +
+    theme_bw(base_size = 14) +
+    ggtitle(paste(gene_of_interest, protein_id)) +
+    ylab("log2 LFQ intensity") +
+    xlab("Condition")
+  
+  protein.plot
+  
+  ggsave(
+    filename = file.path(output_dir, paste0(gene_of_interest, "_protein_abundance.jpg")),
+    plot = protein.plot,
+    width = 6,
+    height = 5,
+    dpi = 600
+  )
+  
+  DEqMS.results[
+    grepl(gene_of_interest, DEqMS.results$Gene.name),
+    c("Gene.name", "logFC", "sca.P.Value", "sca.adj.pval")
+  ]
+  
+} else {
+  message(paste("Gene not found:", gene_of_interest))
+}
+
+```
+
+## 11. Export summaries and combined figures
+
+Export significant-protein table, dataset overview,
+missingness comparison and multi-panel figures.
+
+```{r summaries-and-panels, fig.width=12, fig.height=9}
+
+sig.summary <- data.frame(
+  Cutoff = paste0(
+    "|log2FC| > ",
+    logFC_cutoff,
+    " and DEqMS FDR <= ",
+    fdr_cutoff
+  ),
+  Significant_proteins = sum(
+    DEqMS.results$sca.adj.pval <= fdr_cutoff &
+      abs(DEqMS.results$logFC) > logFC_cutoff,
+    na.rm = TRUE
+  ),
+  Up_in_MCM_1G = sum(
+    DEqMS.results$sca.adj.pval <= fdr_cutoff &
+      DEqMS.results$logFC > logFC_cutoff,
+    na.rm = TRUE
+  ),
+  Up_in_MCM_DLN = sum(
+    DEqMS.results$sca.adj.pval <= fdr_cutoff &
+      DEqMS.results$logFC < -logFC_cutoff,
+    na.rm = TRUE
+  )
+)
+
+sig.summary
+
+write.table(
+  sig.summary,
+  file.path(output_dir, "Significant_protein_summary_DreamAI_DEqMS.txt"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# -----------------------------
+# Dataset overview table
+# -----------------------------
+
+dataset.overview <- data.frame(
+  Step = c("Raw MaxQuant", "After filtering", "After DreamAI"),
+  Features = c(
+    nrow(df.LFQ[, lfq_cols]),
+    nrow(log2.lfq),
+    nrow(protein.matrix)
+  ),
+  Samples = c(
+    length(lfq_cols),
+    ncol(log2.lfq),
+    ncol(protein.matrix)
+  )
+)
+
+dataset.overview
+
+write.table(
+  dataset.overview,
+  file.path(output_dir, "Dataset_overview_features_samples.txt"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# -----------------------------
+# Missingness before vs after DreamAI
+# -----------------------------
+
+overall_missing_before <- mean(is.na(log2.lfq)) * 100
+overall_missing_after <- mean(is.na(protein.matrix)) * 100
+
+missing.before.after <- data.frame(
+  Step = c("Before DreamAI", "After DreamAI"),
+  Missing_values = c(
+    sum(is.na(log2.lfq)),
+    sum(is.na(protein.matrix))
+  ),
+  Missing_percent = round(
+    c(
+      overall_missing_before,
+      overall_missing_after
+    ),
+    2
+  )
+)
+
+missing.before.after
+
+write.table(
+  missing.before.after,
+  file.path(output_dir, "Missingness_before_after_DreamAI.txt"),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+# -----------------------------
+# Multi-panel figures
+# -----------------------------
+
+qc.missing.plot <- missing.plot +
+  ggtitle("A. Missing value distribution")
+
+qc.density.plot <- density.plot +
+  ggtitle("B. LFQ intensity density")
+
+qc.pca.before.plot <- pca.before.plot +
+  ggtitle("C. PCA before DreamAI")
+
+qc.pca.after.plot <- pca.after.plot +
+  ggtitle("D. PCA after DreamAI")
+
+qc.volcano.plot <- volcano.plot +
+  ggtitle("A. Volcano plot")
+
+qc.ma.plot <- ma.plot +
+  ggtitle("B. MA plot")
+
+# Panel 1: missingness and imputation QC
+
+jpeg(
+  file.path(output_dir, "Panel_1_Missingness_Imputation_QC.jpg"),
+  width = 9000,
+  height = 7000,
+  res = 600,
+  quality = 100
+)
+
+grid.arrange(
+  qc.missing.plot,
+  qc.density.plot,
+  qc.pca.before.plot,
+  qc.pca.after.plot,
+  ncol = 2,
+  top = textGrob(
+    "Panel 1: Missingness and DreamAI imputation QC",
+    gp = gpar(fontsize = 18, fontface = "bold")
+  )
+)
+
+dev.off()
+
+# Panel 2: differential abundance
+
+jpeg(
+  file.path(output_dir, "Panel_2_Differential_Abundance.jpg"),
+  width = 7000,
+  height = 10000,
+  res = 600,
+  quality = 100
+)
+
+grid.arrange(
+  qc.volcano.plot,
+  qc.ma.plot,
+  ncol = 1,
+  heights = c(1, 1),
+  top = textGrob(
+    "Panel 2: Differential protein abundance analysis",
+    gp = gpar(fontsize = 18, fontface = "bold")
+  )
+)
+
+dev.off()
+
+# Panel 3: DEqMS diagnostics
+
+jpeg(
+  file.path(output_dir, "Panel_3_DEqMS_Diagnostics.jpg"),
+  width = 9000,
+  height = 7000,
+  res = 600,
+  quality = 100
+)
+
+par(mfrow = c(2, 2), mar = c(5, 5, 4, 2))
+
+VarianceScatterplot(
+  fit4,
+  xlab = "log2(Peptide count + 1)",
+  ylab = "log(Variance)",
+  main = "A. Variance scatterplot"
+)
+
+VarianceBoxplot(
+  fit4,
+  n = max(fit4$count, na.rm = TRUE),
+  xlab = "Peptide count + 1",
+  ylab = "log(Variance)",
+  main = "B. Variance boxplot"
+)
+
+Residualplot(
+  fit4,
+  xlab = "log2(Peptide count + 1)",
+  ylab = "Variance(fitted - observed)",
+  main = "C. Residual plot"
+)
+
+plot.new()
+
+par(mfrow = c(1, 1))
+
+dev.off()
+
+```
+
+## 12. Record the computational environment
+
+```{r session-information}
+
+sessionInfo()
+```
+
+## 13. Exploratory sensitivity analyses
+
+### 13.1 Prepare the exploratory workflow
+
+```{r exploratory-setup}
+
+# -----------------------------
+# Exploratory output folders
+# -----------------------------
+
+exploratory_dir <- file.path(
+  output_dir,
+  "Exploratory_imputation_comparison"
+)
+
+impseq_dir <- file.path(
+  exploratory_dir,
+  "ImpSeq"
+)
+
+no_imputation_dir <- file.path(
+  exploratory_dir,
+  "No_imputation"
+)
+
+dir.create(
+  impseq_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+dir.create(
+  no_imputation_dir,
+  recursive = TRUE,
+  showWarnings = FALSE
+)
+
+# -----------------------------
+# Confirm required package
+# -----------------------------
+
+if (!requireNamespace("rrcovNA", quietly = TRUE)) {
+  stop(
+    paste0(
+      "The rrcovNA package is required for ImpSeq. ",
+      "Install it using install.packages('rrcovNA')."
+    )
+  )
+}
+
+# -----------------------------
+# Reusable exploratory DEqMS function
+# -----------------------------
+
+run_exploratory_deqms <- function(
+    expression_matrix,
+    analysis_name,
+    analysis_title,
+    analysis_output_dir,
+    df_prot,
+    peptide_count_table,
+    logFC_cutoff = 1.0,
+    fdr_cutoff = 0.05
+) {
+  
+  # Ensure matrix format
+  expression_matrix <- as.matrix(expression_matrix)
+  storage.mode(expression_matrix) <- "numeric"
+  
+  # Remove proteins containing non-finite values
+  valid_rows <- apply(
+    expression_matrix,
+    1,
+    function(x) all(is.finite(x))
+  )
+  
+  expression_matrix <- expression_matrix[
+    valid_rows,
+    ,
+    drop = FALSE
+  ]
+  
+  if (nrow(expression_matrix) < 2) {
+    stop(
+      "Too few proteins available for ",
+      analysis_name,
+      " analysis."
+    )
+  }
+  
+  # ----------------------------------
+  # Construct group factor and design
+  # ----------------------------------
+  
+  exploratory_class <- ifelse(
+    grepl(
+      "^LFQ\\.intensity\\.1G_",
+      colnames(expression_matrix)
+    ),
+    "MCM_1G",
+    "MCM_DLN"
+  )
+  
+  exploratory_class <- factor(
+    exploratory_class,
+    levels = c(
+      "MCM_1G",
+      "MCM_DLN"
+    )
+  )
+  
+  exploratory_design <- model.matrix(
+    ~ 0 + exploratory_class
+  )
+  
+  colnames(exploratory_design) <- levels(
+    exploratory_class
+  )
+  
+  # ----------------------------------
+  # Fit limma model
+  # ----------------------------------
+  
+  exploratory_fit1 <- lmFit(
+    expression_matrix,
+    design = exploratory_design
+  )
+  
+  exploratory_contrast <- makeContrasts(
+    MCM_1G - MCM_DLN,
+    levels = exploratory_design
+  )
+  
+  exploratory_fit2 <- contrasts.fit(
+    exploratory_fit1,
+    contrasts = exploratory_contrast
+  )
+  
+  exploratory_fit3 <- eBayes(
+    exploratory_fit2
+  )
+  
+  # ----------------------------------
+  # Add peptide counts for DEqMS
+  # ----------------------------------
+  
+  exploratory_fit3$count <- peptide_count_table[
+    rownames(exploratory_fit3$coefficients),
+    "count"
+  ]
+  
+  if (any(is.na(exploratory_fit3$count))) {
+    
+    missing_count_ids <- rownames(
+      exploratory_fit3$coefficients
+    )[is.na(exploratory_fit3$count)]
+    
+    stop(
+      paste0(
+        "Missing peptide counts for ",
+        length(missing_count_ids),
+        " proteins in ",
+        analysis_name,
+        "."
+      )
+    )
+  }
+  
+  if (any(exploratory_fit3$count <= 0)) {
+    stop(
+      "Non-positive peptide counts detected in ",
+      analysis_name,
+      "."
+    )
+  }
+  
+  # ----------------------------------
+  # Fit DEqMS model
+  # ----------------------------------
+  
+  exploratory_fit4 <- spectraCounteBayes(
+    exploratory_fit3,
+    fit.method = "loess",
+    coef_col = 1
+  )
+  
+  exploratory_results <- outputResult(
+    exploratory_fit4,
+    coef_col = 1
+  )
+  
+  # ----------------------------------
+  # Add gene names
+  # ----------------------------------
+  
+  exploratory_results$Gene.name <- df_prot[
+    exploratory_results$gene,
+    "Gene.names"
+  ]
+  
+  missing_gene_names <- (
+    is.na(exploratory_results$Gene.name) |
+      exploratory_results$Gene.name == ""
+  )
+  
+  exploratory_results$Gene.name[
+    missing_gene_names
+  ] <- exploratory_results$gene[
+    missing_gene_names
+  ]
+  
+  # ----------------------------------
+  # Classify proteins
+  # ----------------------------------
+  
+  exploratory_results$significant <- with(
+    exploratory_results,
+    sca.adj.pval <= fdr_cutoff &
+      abs(logFC) > logFC_cutoff
+  )
+  
+  exploratory_results$Regulation <- "Not significant"
+  
+  exploratory_results$Regulation[
+    exploratory_results$logFC > logFC_cutoff &
+      exploratory_results$sca.adj.pval <= fdr_cutoff
+  ] <- "Up in MCM-1G"
+  
+  exploratory_results$Regulation[
+    exploratory_results$logFC < -logFC_cutoff &
+      exploratory_results$sca.adj.pval <= fdr_cutoff
+  ] <- "Up in MCM-DLN"
+  
+  exploratory_results$Regulation <- factor(
+    exploratory_results$Regulation,
+    levels = c(
+      "Up in MCM-DLN",
+      "Up in MCM-1G",
+      "Not significant"
+    )
+  )
+  
+  # Avoid infinite values if adjusted p-value is zero
+  exploratory_results$plot.adj.pval <- pmax(
+    exploratory_results$sca.adj.pval,
+    .Machine$double.xmin
+  )
+  
+  exploratory_results$minus.log10.adj.pval <- -log10(
+    exploratory_results$plot.adj.pval
+  )
+  
+  # ----------------------------------
+  # Save complete DEqMS result table
+  # ----------------------------------
+  
+  write.table(
+    exploratory_results,
+    file.path(
+      analysis_output_dir,
+      paste0(
+        "DEqMS_results_",
+        analysis_name,
+        ".txt"
+      )
+    ),
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  # ----------------------------------
+  # Save significant proteins
+  # ----------------------------------
+  
+  exploratory_significant <- exploratory_results[
+    exploratory_results$significant,
+    ,
+    drop = FALSE
+  ]
+  
+  exploratory_significant <- exploratory_significant[
+    order(
+      exploratory_significant$sca.adj.pval,
+      -abs(exploratory_significant$logFC)
+    ),
+    ,
+    drop = FALSE
+  ]
+  
+  write.table(
+    exploratory_significant,
+    file.path(
+      analysis_output_dir,
+      paste0(
+        "Significant_proteins_",
+        analysis_name,
+        ".txt"
+      )
+    ),
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  # ----------------------------------
+  # Select labels for volcano plot
+  # ----------------------------------
+  
+  exploratory_labels <- exploratory_results[
+    exploratory_results$significant &
+      !is.na(exploratory_results$Gene.name) &
+      exploratory_results$Gene.name != "" &
+      is.finite(
+        exploratory_results$minus.log10.adj.pval
+      ),
+    ,
+    drop = FALSE
+  ]
+  
+  exploratory_labels <- exploratory_labels[
+    order(exploratory_labels$sca.adj.pval),
+    ,
+    drop = FALSE
+  ]
+  
+  exploratory_labels <- head(
+    exploratory_labels,
+    20
+  )
+  
+  # ----------------------------------
+  # Volcano plot
+  # ----------------------------------
+  
+  exploratory_volcano <- ggplot(
+    exploratory_results,
+    aes(
+      x = logFC,
+      y = minus.log10.adj.pval
+    )
+  ) +
+    geom_point(
+      aes(color = Regulation),
+      size = 0.6
+    ) +
+    geom_vline(
+      xintercept = c(
+        -logFC_cutoff,
+        logFC_cutoff
+      ),
+      colour = "red"
+    ) +
+    geom_hline(
+      yintercept = -log10(fdr_cutoff),
+      colour = "red"
+    ) +
+    geom_vline(
+      xintercept = 0,
+      colour = "black"
+    ) +
+    scale_colour_manual(
+      values = c(
+        "Up in MCM-DLN" = "blue",
+        "Up in MCM-1G" = "orange",
+        "Not significant" = "grey75"
+      )
+    ) +
+    theme_bw(base_size = 16) +
+    labs(
+      title = analysis_title,
+      x = expression(
+        log[2] * "(MCM-1G / MCM-DLN)"
+      ),
+      y = expression(
+        -log[10] * "(DEqMS adjusted p-value)"
+      ),
+      colour = "Protein regulation",
+      caption = paste0(
+        "Exploratory analysis; cutoffs: |log2FC| > ",
+        logFC_cutoff,
+        " and DEqMS adjusted p-value <= ",
+        fdr_cutoff
+      )
+    )
+  
+  if (nrow(exploratory_labels) > 0) {
+    
+    exploratory_volcano <- exploratory_volcano +
+      geom_text_repel(
+        data = exploratory_labels,
+        aes(label = Gene.name),
+        max.overlaps = 20,
+        size = 3
+      )
+  }
+  
+  ggsave(
+    filename = file.path(
+      analysis_output_dir,
+      paste0(
+        "Volcano_plot_",
+        analysis_name,
+        "_DEqMS.jpg"
+      )
+    ),
+    plot = exploratory_volcano,
+    width = 8,
+    height = 7,
+    dpi = 600
+  )
+  
+  # ----------------------------------
+  # Analysis summary
+  # ----------------------------------
+  
+  exploratory_summary <- data.frame(
+    Analysis = analysis_name,
+    Proteins_tested = nrow(exploratory_results),
+    Significant_proteins = sum(
+      exploratory_results$significant,
+      na.rm = TRUE
+    ),
+    Up_in_MCM_1G = sum(
+      exploratory_results$Regulation == "Up in MCM-1G",
+      na.rm = TRUE
+    ),
+    Up_in_MCM_DLN = sum(
+      exploratory_results$Regulation == "Up in MCM-DLN",
+      na.rm = TRUE
+    ),
+    Log2FC_cutoff = logFC_cutoff,
+    FDR_cutoff = fdr_cutoff,
+    stringsAsFactors = FALSE
+  )
+  
+  write.table(
+    exploratory_summary,
+    file.path(
+      analysis_output_dir,
+      paste0(
+        "Summary_",
+        analysis_name,
+        ".txt"
+      )
+    ),
+    sep = "\t",
+    row.names = FALSE,
+    quote = FALSE
+  )
+  
+  return(
+    list(
+      results = exploratory_results,
+      significant = exploratory_significant,
+      summary = exploratory_summary,
+      volcano = exploratory_volcano
+    )
+  )
+}
+
+```
+
+### 13.2 ImpSeq analysis
+
+ImpSeq is applied to the same filtered log2 LFQ matrix.
+
+```{r impseq-sensitivity}
+
+message(
+  "Starting exploratory ImpSeq imputation and DEqMS analysis."
+)
+
+# impSeq operates on the filtered log2 LFQ matrix.
+# Proteins are rows and measurement replicates are columns.
+
+impseq.matrix <- rrcovNA::impSeq(
+  as.matrix(log2.lfq)
+)
+
+impseq.matrix <- as.matrix(
+  impseq.matrix
+)
+
+storage.mode(impseq.matrix) <- "numeric"
+
+rownames(impseq.matrix) <- rownames(
+  log2.lfq
+)
+
+colnames(impseq.matrix) <- colnames(
+  log2.lfq
+)
+
+# Confirm that imputation produced a complete matrix
+if (anyNA(impseq.matrix)) {
+  stop(
+    "ImpSeq did not replace all missing values."
+  )
+}
+
+if (any(!is.finite(impseq.matrix))) {
+  stop(
+    "ImpSeq produced non-finite values."
+  )
+}
+
+# Save ImpSeq-imputed matrix
+write.table(
+  impseq.matrix,
+  file.path(
+    impseq_dir,
+    "ImpSeq_imputed_Melanoma_LFQ.tsv"
+  ),
+  sep = "\t",
+  quote = FALSE
+)
+
+# Run only DEqMS and volcano plot
+impseq.analysis <- run_exploratory_deqms(
+  expression_matrix = impseq.matrix,
+  analysis_name = "ImpSeq",
+  analysis_title = paste0(
+    "Exploratory DEqMS analysis after ImpSeq imputation"
+  ),
+  analysis_output_dir = impseq_dir,
+  df_prot = df.prot,
+  peptide_count_table = pep.count.table,
+  logFC_cutoff = logFC_cutoff,
+  fdr_cutoff = fdr_cutoff
+)
+
+```
+
+### 13.3 Complete-case sensitivity analysis
+
+limma and DEqMS require complete samples - restrict
+
+```{r complete-case-sensitivity}
+
+message(
+  paste0(
+    "Starting exploratory DEqMS analysis without imputation. ",
+    "Only proteins complete across all samples are included."
+  )
+)
+
+# limma and DEqMS require a complete expression matrix.
+# Therefore, the no-imputation analysis is restricted to
+# proteins without missing LFQ values across all 18 samples.
+
+no.imputation.matrix <- log2.lfq[
+  complete.cases(log2.lfq),
+  ,
+  drop = FALSE
+]
+
+if (nrow(no.imputation.matrix) < 2) {
+  stop(
+    paste0(
+      "Fewer than two proteins have complete LFQ measurements ",
+      "across all samples. The no-imputation analysis cannot ",
+      "be performed."
+    )
+  )
+}
+
+message(
+  "Proteins retained without imputation: ",
+  nrow(no.imputation.matrix)
+)
+
+# Save complete-case matrix
+write.table(
+  no.imputation.matrix,
+  file.path(
+    no_imputation_dir,
+    "Complete_case_Melanoma_LFQ_no_imputation.tsv"
+  ),
+  sep = "\t",
+  quote = FALSE
+)
+
+# Run only DEqMS and volcano plot
+no.imputation.analysis <- run_exploratory_deqms(
+  expression_matrix = no.imputation.matrix,
+  analysis_name = "No_imputation_complete_cases",
+  analysis_title = paste0(
+    "Exploratory DEqMS analysis without imputation"
+  ),
+  analysis_output_dir = no_imputation_dir,
+  df_prot = df.prot,
+  peptide_count_table = pep.count.table,
+  logFC_cutoff = logFC_cutoff,
+  fdr_cutoff = fdr_cutoff
+)
+
+```
+
+### 13.4 Compare sensitivity-analysis results
+
+
+```{r sensitivity-summary}
+
+exploratory.comparison <- rbind(
+  data.frame(
+    Method = "DreamAI",
+    Proteins_tested = nrow(DEqMS.results),
+    Significant_proteins = sum(
+      DEqMS.results$sca.adj.pval <= fdr_cutoff &
+        abs(DEqMS.results$logFC) > logFC_cutoff,
+      na.rm = TRUE
+    ),
+    Up_in_MCM_1G = sum(
+      DEqMS.results$sca.adj.pval <= fdr_cutoff &
+        DEqMS.results$logFC > logFC_cutoff,
+      na.rm = TRUE
+    ),
+    Up_in_MCM_DLN = sum(
+      DEqMS.results$sca.adj.pval <= fdr_cutoff &
+        DEqMS.results$logFC < -logFC_cutoff,
+      na.rm = TRUE
+    )
+  ),
+  data.frame(
+    Method = "ImpSeq",
+    Proteins_tested =
+      impseq.analysis$summary$Proteins_tested,
+    Significant_proteins =
+      impseq.analysis$summary$Significant_proteins,
+    Up_in_MCM_1G =
+      impseq.analysis$summary$Up_in_MCM_1G,
+    Up_in_MCM_DLN =
+      impseq.analysis$summary$Up_in_MCM_DLN
+  ),
+  data.frame(
+    Method = "No imputation (complete cases)",
+    Proteins_tested =
+      no.imputation.analysis$summary$Proteins_tested,
+    Significant_proteins =
+      no.imputation.analysis$summary$Significant_proteins,
+    Up_in_MCM_1G =
+      no.imputation.analysis$summary$Up_in_MCM_1G,
+    Up_in_MCM_DLN =
+      no.imputation.analysis$summary$Up_in_MCM_DLN
+  )
+)
+
+write.table(
+  exploratory.comparison,
+  file.path(
+    exploratory_dir,
+    "DreamAI_ImpSeq_NoImputation_comparison.txt"
+  ),
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+print(exploratory.comparison)
+
+message(
+  paste0(
+    "Exploratory ImpSeq and no-imputation analyses completed. ",
+    "No PCA, MA plot, heatmap, pathway analysis, or other ",
+    "downstream analysis was performed for these alternatives."
+  )
+)
+```
