@@ -1,0 +1,2 @@
+Cutoff	Significant_proteins	Up_in_MCM_1G	Up_in_MCM_DLN
+|log2FC| > 1 and DEqMS FDR <= 0.05	10	5	5

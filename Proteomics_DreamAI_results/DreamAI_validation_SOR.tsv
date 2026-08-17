@@ -1,0 +1,81 @@
+scenario	run	method	SOR
+MAR	1	Column mean	54
+MAR	1	DreamAI	18
+MAR	1	Global minimum	72
+MAR	1	Row mean	36
+MAR	2	Column mean	54
+MAR	2	DreamAI	18
+MAR	2	Global minimum	72
+MAR	2	Row mean	36
+MAR	3	Column mean	54
+MAR	3	DreamAI	18
+MAR	3	Global minimum	72
+MAR	3	Row mean	36
+MAR	4	Column mean	54
+MAR	4	DreamAI	18
+MAR	4	Global minimum	72
+MAR	4	Row mean	36
+MAR	5	Column mean	54
+MAR	5	DreamAI	18
+MAR	5	Global minimum	72
+MAR	5	Row mean	36
+MAR	6	Column mean	54
+MAR	6	DreamAI	18
+MAR	6	Global minimum	72
+MAR	6	Row mean	36
+MAR	7	Column mean	54
+MAR	7	DreamAI	18
+MAR	7	Global minimum	72
+MAR	7	Row mean	36
+MAR	8	Column mean	54
+MAR	8	DreamAI	18
+MAR	8	Global minimum	72
+MAR	8	Row mean	36
+MAR	9	Column mean	54
+MAR	9	DreamAI	18
+MAR	9	Global minimum	72
+MAR	9	Row mean	36
+MAR	10	Column mean	54
+MAR	10	DreamAI	18
+MAR	10	Global minimum	72
+MAR	10	Row mean	36
+MNAR-style	1	Column mean	54
+MNAR-style	1	DreamAI	18
+MNAR-style	1	Global minimum	72
+MNAR-style	1	Row mean	36
+MNAR-style	2	Column mean	54
+MNAR-style	2	DreamAI	18
+MNAR-style	2	Global minimum	72
+MNAR-style	2	Row mean	36
+MNAR-style	3	Column mean	54
+MNAR-style	3	DreamAI	18
+MNAR-style	3	Global minimum	72
+MNAR-style	3	Row mean	36
+MNAR-style	4	Column mean	54
+MNAR-style	4	DreamAI	18
+MNAR-style	4	Global minimum	72
+MNAR-style	4	Row mean	36
+MNAR-style	5	Column mean	54
+MNAR-style	5	DreamAI	18
+MNAR-style	5	Global minimum	72
+MNAR-style	5	Row mean	36
+MNAR-style	6	Column mean	54
+MNAR-style	6	DreamAI	18
+MNAR-style	6	Global minimum	72
+MNAR-style	6	Row mean	36
+MNAR-style	7	Column mean	54
+MNAR-style	7	DreamAI	18
+MNAR-style	7	Global minimum	72
+MNAR-style	7	Row mean	36
+MNAR-style	8	Column mean	54
+MNAR-style	8	DreamAI	18
+MNAR-style	8	Global minimum	72
+MNAR-style	8	Row mean	36
+MNAR-style	9	Column mean	54
+MNAR-style	9	DreamAI	18
+MNAR-style	9	Global minimum	72
+MNAR-style	9	Row mean	36
+MNAR-style	10	Column mean	54
+MNAR-style	10	DreamAI	18
+MNAR-style	10	Global minimum	72
+MNAR-style	10	Row mean	36

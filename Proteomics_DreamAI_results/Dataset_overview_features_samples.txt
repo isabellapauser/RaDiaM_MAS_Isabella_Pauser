@@ -1,0 +1,4 @@
+Step	Features	Samples
+Raw MaxQuant	3583	18
+After filtering	1950	18
+After DreamAI	1950	18
