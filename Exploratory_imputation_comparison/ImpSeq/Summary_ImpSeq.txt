@@ -1,0 +1,2 @@
+Analysis	Proteins_tested	Significant_proteins	Up_in_MCM_1G	Up_in_MCM_DLN	Log2FC_cutoff	FDR_cutoff
+ImpSeq	1950	11	5	6	1	0.05

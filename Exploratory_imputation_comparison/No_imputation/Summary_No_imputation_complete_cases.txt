@@ -1,0 +1,2 @@
+Analysis	Proteins_tested	Significant_proteins	Up_in_MCM_1G	Up_in_MCM_DLN	Log2FC_cutoff	FDR_cutoff
+No_imputation_complete_cases	1216	6	3	3	1	0.05

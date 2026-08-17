@@ -1,0 +1,4 @@
+Method	Proteins_tested	Significant_proteins	Up_in_MCM_1G	Up_in_MCM_DLN
+DreamAI	1950	10	5	5
+ImpSeq	1950	11	5	6
+No imputation (complete cases)	1216	6	3	3
